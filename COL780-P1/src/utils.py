@@ -90,7 +90,7 @@ def render(img, obj, projection, model, color=False):
         points = np.array([vertices[vertex - 1] for vertex in face_vertices])
         points = np.dot(points, scale_matrix)
         points = np.array([[p[0] + w / 2, p[1] + h / 2, p[2]] for p in points])
-        dst = cv2.perspectiveTransform(points.reshape(-1, 1, 3), projection)
+        dst = CustomCV2.perspectiveTransform(points.reshape(-1, 1, 3), projection)
         imgpts = np.int32(dst)
         if color is False:
             cv2.fillConvexPoly(img, imgpts, DEFAULT_COLOR)
@@ -112,7 +112,7 @@ def order_points(pts):
 
 
 def refine_corners(gray, corners):
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    criteria = (CustomCV2.TERM_CRITERIA_EPS + CustomCV2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     return cv2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
 
 
@@ -139,7 +139,7 @@ def decode_tag(warped_tag):
     start = int(2 * cell)
     end = int(6 * cell)
     core = thresh[start:end, start:end]
-    core = cv2.resize(core, (200, 200), interpolation=cv2.INTER_NEAREST)
+    core = CustomCV2.resize(core, (200, 200), interpolation=CustomCV2.INTER_NEAREST)
     c_cell = 50.0
 
     def get_core_val(r, c):
@@ -227,7 +227,7 @@ def process_frame(frame):
                 continue
 
             rect = order_points(quad)
-            rect = refine_corners(gray, rect)
+            # rect = refine_corners(gray, rect)
             
             side = 400
             dst_pts = np.array([[0, 0], [side - 1, 0], [side - 1, side - 1], [0, side - 1]], dtype="float32")
@@ -251,5 +251,7 @@ def process_frame(frame):
         cv2.polylines(frame, [np.int32(rect)], True, (0, 255, 0), 2)
         cv2.putText(frame, f"ID: {tag['id']}", tuple(np.int32(rect[0])), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"Rot: {tag['rotation']} deg", tuple(np.int32(rect[1])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
     return frame, stable_tags

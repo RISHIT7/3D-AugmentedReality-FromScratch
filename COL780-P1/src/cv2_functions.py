@@ -672,100 +672,88 @@ class CustomCV2:
     
     @staticmethod
     def resize(src: np.ndarray, dsize: Tuple[int, int], interpolation: int = INTER_LINEAR) -> np.ndarray:
-        """
-        Resize image.
-        
-        Args:
-            src: Input image
-            dsize: Output image size
-            interpolation: Interpolation method
+        dst_w, dst_h = dsize
+        src_h, src_w = src.shape[:2]
+
+        if interpolation == CustomCV2.INTER_NEAREST:
+            row_ratio = src_h / dst_h
+            col_ratio = src_w / dst_w
+
+            dst_y, dst_x = np.indices((dst_h, dst_w))
+            src_x = np.clip((dst_x * col_ratio).astype(np.int32),
+                            0, src_w - 1)
+            src_y = np.clip((dst_y * row_ratio).astype(np.int32),
+                            0, src_h - 1)
             
-        Returns:
-            Resized image
-        """
-        raise NotImplementedError("resize needs implementation")
+            return src[src_y, src_x]
+        elif interpolation == CustomCV2.INTER_LINEAR:
+            x = np.linspace(0, src_w-1, dst_w)
+            y = np.linspace(0, src_h-1, dst_h)
+
+            x_idx, y_idx = np.meshgrid(x, y)
+            x_floor, y_floor = np.floor(x_idx).astype(np.int32), np.floor(y_idx).astype(np.int32)
+            x_ceil = np.ceil(x_idx).astype(np.int32)
+            y_ceil = np.ceil(y_idx).astype(np.int32)
+
+            dx = x_idx - x_floor
+            dy = y_idx - y_floor
+
+            if src.ndim == 3:
+                dx = dx[..., np.newaxis]
+                dy = dy[..., np.newaxis]
+
+            top_left = src[np.clip(y_floor, 0, src_h-1), np.clip(x_floor, 0, src_w-1)]
+            top_right = src[np.clip(y_floor, 0, src_h-1), np.clip(x_ceil, 0, src_w-1)]
+            bottom_left = src[np.clip(y_ceil, 0, src_h-1), np.clip(x_floor, 0, src_w-1)]
+            bottom_right = src[np.clip(y_ceil, 0, src_w-1), np.clip(x_ceil, 0, src_w-1)]
+
+            top = top_left * (1 - dx) + top_right * dx
+            bottom = bottom_left * (1 - dx) + bottom_right * dx
+            resized = top * (1 - dy) + bottom * dy
+            return resized.astype(src.dtype)
     
     @staticmethod
     def perspectiveTransform(src: np.ndarray, m: np.ndarray) -> np.ndarray:
-        """
-        Perform perspective transformation on points.
-        
-        Args:
-            src: Input points
-            m: 3x3 transformation matrix
-            
-        Returns:
-            Transformed points
-        """
-        raise NotImplementedError("perspectiveTransform needs implementation")
-    
-    @staticmethod
-    def polylines(img: np.ndarray, pts: List[np.ndarray], isClosed: bool, 
-                  color: Tuple[int, int, int], thickness: int = 1) -> np.ndarray:
-        """
-        Draw polylines on image.
-        
-        Args:
-            img: Input/output image
-            pts: Array of polygonal curves
-            isClosed: Whether polylines are closed
-            color: Polyline color
-            thickness: Line thickness
-            
-        Returns:
-            Image with drawn polylines
-        """
-        raise NotImplementedError("polylines needs implementation")
-    
-    @staticmethod
-    def putText(img: np.ndarray, text: str, org: Tuple[int, int], fontFace: int,
-                fontScale: float, color: Tuple[int, int, int], thickness: int = 1) -> np.ndarray:
-        """
-        Draw text on image.
-        
-        Args:
-            img: Input/output image
-            text: Text string to draw
-            org: Bottom-left corner of text
-            fontFace: Font type
-            fontScale: Font scale factor
-            color: Text color
-            thickness: Line thickness
-            
-        Returns:
-            Image with drawn text
-        """
-        raise NotImplementedError("putText needs implementation")
-    
-    @staticmethod
-    def fillConvexPoly(img: np.ndarray, points: np.ndarray, color: Tuple[int, int, int]) -> np.ndarray:
-        """
-        Fill convex polygon.
-        
-        Args:
-            img: Input/output image
-            points: Polygon vertices
-            color: Fill color
-            
-        Returns:
-            Image with filled polygon
-        """
-        raise NotImplementedError("fillConvexPoly needs implementation")
-    
+        if src.ndim == 3:
+            pts = src.reshape(-1, 2)
+        else:
+            pts = src
+
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        homogenous_pts = np.hstack([pts, ones])
+
+        transformed_pts = np.dot(homogenous_pts, m.T)
+
+        w = transformed_pts[:, 2:3]
+        w[w == 0] = 1e-9
+
+        normalized_pts = transformed_pts[:, :2] / w
+
+        if src.ndim == 3:
+            return normalized_pts.reshape(-1, 1, 2).astype(np.float32)
+        else:
+            return normalized_pts.astype(np.float32)
+
     @staticmethod
     def normalize(src: np.ndarray, dst: Optional[np.ndarray], alpha: float, 
                   beta: float, norm_type: int) -> np.ndarray:
-        """
-        Normalize array to range.
-        
-        Args:
-            src: Input array
-            dst: Output array (can be None)
-            alpha: Lower range boundary
-            beta: Upper range boundary
-            norm_type: Normalization type
+        if norm_type == CustomCV2.NORM_MINMAX:
+            src_min = src.min()
+            src_max = src.max()
+
+            if src_max - src_min < 1e-9:
+                return np.full_like(src, alpha)
             
-        Returns:
-            Normalized array
-        """
-        raise NotImplementedError("normalize needs implementation")
+            scale = (beta - alpha) / (src_max - src_min)
+            shift = alpha - src_min * scale
+
+            res = src * scale + shift
+
+            if src.dtype == np.uint8:
+                res = np.clip(res, 0, 255).astype(np.uint8)
+            else:
+                res = res.astype(src.dtype)
+            
+            return res
+        else:
+            raise NotImplementedError("Only NORM_MINMAX is implemented in normalize")
