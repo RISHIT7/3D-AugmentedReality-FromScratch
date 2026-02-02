@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Tuple, List, Optional, Any
 import math
-from concurrent.futures import ThreadPoolExecutor
 
 GRAY_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
 
@@ -74,6 +73,66 @@ class CustomCV2:
         return np.clip(results, 0, 255).astype(src.dtype)
 
     @staticmethod
+    def findCornersQuadrilateral(contour: np.ndarray) -> np.ndarray:
+        """
+        Finds the 4 corners of a quadrilateral using Radial Distance Peak Detection.
+        More stable than approxPolyDP for AR tags.
+        """
+        # 1. Standardize Input
+        if contour.ndim == 3:
+            pts = contour.reshape(-1, 2)
+        else:
+            pts = contour
+
+        if len(pts) < 4:
+            return pts.reshape(-1, 1, 2)
+
+        # 2. Centroid Calculation (Fast Mean)
+        # We use the geometric center of the contour points
+        centroid = np.mean(pts, axis=0)
+
+        # 3. Distance Signal
+        # Compute squared Euclidean distance from center to every boundary point
+        diff = pts - centroid
+        dists_sq = np.sum(diff**2, axis=1)
+
+        # 4. Signal Smoothing
+        # Apply a small convolution to remove pixel noise (jagged edges)
+        # which creates fake local peaks.
+        kernel_size = 5
+        # Wrap padding handles the closed loop structure
+        dists_padded = np.pad(dists_sq, (kernel_size//2, kernel_size//2), mode='wrap')
+        dists_smooth = np.convolve(dists_padded, np.ones(kernel_size)/kernel_size, mode='valid')
+
+        # 5. Peak Detection (Vectorized)
+        # A point is a peak if it is further than its neighbors
+        prev_pts = np.roll(dists_smooth, 1)
+        next_pts = np.roll(dists_smooth, -1)
+        
+        # Local Maxima mask
+        peaks_mask = (dists_smooth > prev_pts) & (dists_smooth > next_pts)
+        peak_indices = np.where(peaks_mask)[0]
+
+        # 6. Filter & Fallback
+        if len(peak_indices) > 4:
+            # If noise created extra peaks, pick the 4 farthest from center
+            peak_dists = dists_smooth[peak_indices]
+            # argsort is ascending, so we take the last 4
+            top_indices = np.argsort(peak_dists)[-4:]
+            final_indices = peak_indices[top_indices]
+        elif len(peak_indices) < 4:
+            # Fallback to simple bounding box if shape is too distorted
+            # (Rare for valid AR tags)
+            return CustomCV2.approxPolyDP(contour, 0.02 * CustomCV2.arcLength(contour, True), True)
+        else:
+            final_indices = peak_indices
+
+        corners = pts[final_indices]
+        
+        # Return in (4, 1, 2) format to match OpenCV standards
+        return corners.reshape(-1, 1, 2).astype(np.int32)
+
+    @staticmethod
     def threshold(src: np.ndarray, thresh: float, maxval: float, type: int) -> Tuple[float, np.ndarray]:
         if type & CustomCV2.THRESH_OTSU:
             hist, _ = np.histogram(src, bins=256, range=(0, 256))
@@ -140,7 +199,6 @@ class CustomCV2:
         else:
             result = src.copy()
             
-        print(thresh)
         return thresh, result.astype(np.uint8)
 
     @staticmethod
@@ -175,35 +233,19 @@ class CustomCV2:
 
     @staticmethod
     def findContours(image: np.ndarray, mode: int = 0, method: int = 1) -> List[np.ndarray]:
-        """
-        Fast Proxy-Contours. 
-        Downscales image to trace faster, then upscales coordinates.
-        Speedup: ~16x for SCALE=4.
-        """
-        SCALE = 4
-        
-        small_img = image[::SCALE, ::SCALE]
-        
-        binary = (small_img > 0).astype(np.uint8)
+        binary = (image > 0).astype(np.uint8)
         binary = np.pad(binary, 1, mode='constant', constant_values=0)
         h, w = binary.shape
         
         visited = np.zeros_like(binary, dtype=bool)
         contours = []
         
-        # Pre-calculate offsets to avoid list creation in loop
-        # N, NE, E, SE, S, SW, W, NW
         OFFSETS_Y = [-1, -1, 0, 1, 1, 1, 0, -1]
         OFFSETS_X = [0, 1, 1, 1, 0, -1, -1, -1]
         
-        # 3. Scan for start points
-        # Optimization: Only scan pixels that are potential borders? 
-        # For now, standard scan on small image is fast enough.
         for y in range(1, h - 1):
             for x in range(1, w - 1):
                 if binary[y, x] == 1 and not visited[y, x]:
-                    # Check boundary condition (at least one 0 neighbor)
-                    # Inline check for speed
                     is_border = False
                     if binary[y-1, x] == 0 or binary[y+1, x] == 0 or \
                        binary[y, x-1] == 0 or binary[y, x+1] == 0:
@@ -215,8 +257,7 @@ class CustomCV2:
                         backtrack = 0
                         
                         while True:
-                            # Add point (Remove padding + Rescale to original size)
-                            contour_pts.append([(cx - 1) * SCALE, (cy - 1) * SCALE])
+                            contour_pts.append([(cx - 1), (cy - 1)])
                             visited[cy, cx] = True
                             
                             found = False
@@ -241,75 +282,195 @@ class CustomCV2:
         return contours, None    
 
     @staticmethod
-    def contourArea(contour: np.ndarray, oriented: bool = False) -> float:
+    def Sobel(src: np.ndarray, threshold: int = 0) -> np.ndarray:
         """
-        Calculate contour area.
+        Highly optimized Sobel Edge Detection (3x3).
+        Uses vectorized slicing and separable kernels for maximum FPS.
+        Returns: Gradient Magnitude (L1 Norm approximation for speed).
+        """
+        img = src.astype(np.int16)
+        p = np.pad(img, 1, mode='reflect')
+        smooth_y = p[:-2, :] + (2 * p[1:-1, :]) + p[2:, :]
         
-        Args:
-            contour: Input contour
-            oriented: If True, returns signed area
-            
-        Returns:
-            Area value
-        """
-        raise NotImplementedError("contourArea needs implementation")
+        gx = smooth_y[:, 2:] - smooth_y[:, :-2]
+        smooth_x = p[:, :-2] + (2 * p[:, 1:-1]) + p[:, 2:]
+        
+        gy = smooth_x[2:, :] - smooth_x[:-2, :]
+        
+        magnitude = np.abs(gx) + np.abs(gy)
+        
+        # binarize edges
+        magnitude = np.where(magnitude > threshold, 255, 0)
+
+        return magnitude.astype(np.uint8)
+
+    @staticmethod
+    def contourArea(contour: np.ndarray, oriented: bool = False) -> float:
+        if contour.ndim == 3:
+            pts = contour.reshape(-1, 2)
+        else:
+            pts = contour
+
+        if len(pts) < 3:
+            return 0.0
+        
+        x = pts[:, 0]
+        y = pts[:, 1]
+        x_next = np.roll(x, -1)
+        y_next = np.roll(y, -1)
+
+        area = 0.5 * (np.dot(x, y_next) - np.dot(x_next, y))
+
+        if oriented:
+            return float(area)
+        else:
+            return abs(float(area))
     
     @staticmethod
     def arcLength(curve: np.ndarray, closed: bool) -> float:
-        """
-        Calculate contour perimeter.
+        if curve.ndim == 3:
+            pts = curve.reshape(-1, 2)
+        else:
+            pts = curve
+
+        if len(pts) < 2:
+            return 0.0
         
-        Args:
-            curve: Input contour
-            closed: Whether contour is closed
-            
-        Returns:
-            Perimeter length
-        """
-        raise NotImplementedError("arcLength needs implementation")
+        if closed:
+            diffs = pts - np.roll(pts, -1, axis=0)
+        else:
+            diffs = pts[:-1] - pts[1:]
+
+        distances = np.sqrt(np.einsum('ij,ij->i', diffs, diffs))
+        
+        return float(np.sum(distances))
     
     @staticmethod
     def approxPolyDP(curve: np.ndarray, epsilon: float, closed: bool) -> np.ndarray:
-        """
-        Approximate polygonal curve with specified precision.
-        Uses Douglas-Peucker algorithm.
+        if curve.ndim == 3:
+            pts = curve.reshape(-1, 2).copy()
+        else:
+            pts = curve.copy()
+
+        if len(pts) < 3:
+            return curve.copy()
         
-        Args:
-            curve: Input contour
-            epsilon: Approximation accuracy
-            closed: Whether curve is closed
+        def perpendicular_distance(pt, line_start, line_end):
+            line_vec = line_end - line_start
+            line_len_sq = np.dot(line_vec, line_vec)
+            if line_len_sq < 1e-10:
+                return np.linalg.norm(pt - line_start)
             
-        Returns:
-            Approximated polygon
-        """
-        raise NotImplementedError("approxPolyDP needs implementation")
+            point_vec = pt - line_start
+            t = np.dot(point_vec, line_vec) / line_len_sq
+            t = np.clip(t, 0.0, 1.0)
+
+            closest = line_start + t * line_vec
+            return np.linalg.norm(pt - closest)
+        
+        def recurse(start, end, keep_mask):
+            if end - start <= 1:
+                return
+            
+            max_dist = 0.0
+            max_idx = start
+
+            for i in range(start + 1, end):
+                dist = perpendicular_distance(pts[i], pts[start], pts[end])
+                if dist > max_dist:
+                    max_dist = dist
+                    max_idx = i
+            
+            if max_dist > epsilon:
+                keep_mask[max_idx] = True
+                recurse(start, max_idx, keep_mask)
+                recurse(max_idx, end, keep_mask)
+
+        n = len(pts)
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[0] = True
+        keep_mask[-1] = True
+
+        recurse(0, n - 1, keep_mask)
+        
+        approx = pts[keep_mask]
+
+        if len(approx) > 4 and np.allclose(approx[0], approx[-1], atol=1.0) and closed:
+            approx = approx[:-1]
+
+        return approx.reshape(-1, 1, 2).astype(np.int32)
     
     @staticmethod
     def isContourConvex(contour: np.ndarray) -> bool:
-        """
-        Test if contour is convex.
+        if contour.ndim == 3:
+            pts = contour.reshape(-1, 2)
+        else:
+            pts = contour
+
+        n = len(pts)
+        if n < 4:
+            return True
         
-        Args:
-            contour: Input contour
-            
-        Returns:
-            True if convex, False otherwise
-        """
-        raise NotImplementedError("isContourConvex needs implementation")
-    
+        sign = 0
+        for i in range(n):
+            d1 = pts[(i + 1) % n] - pts[i]
+            d2 = pts[(i + 2) % n] - pts[(i + 1) % n]
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+
+            if abs(cross) < 1e-10:
+                continue
+
+            current_sign = np.sign(cross)
+            if current_sign != 0:
+                if sign == 0:
+                    sign = current_sign
+                elif sign != current_sign:
+                    return False
+        return True
+
     @staticmethod
-    def moments(array: np.ndarray, binaryImage: bool = False) -> dict:
-        """
-        Calculate all moments up to third order.
+    def moments(contour: np.ndarray, binaryImage: bool = False) -> dict:
+        if contour.ndim == 3:
+            pts = contour.reshape(-1, 2).astype(np.float64)
+        else:
+            pts = contour.astype(np.float64)
         
-        Args:
-            array: Raster image or contour
-            binaryImage: If True, all non-zero pixels are treated as 1
-            
-        Returns:
-            Dictionary of moments
-        """
-        raise NotImplementedError("moments needs implementation")
+        n = len(pts)
+        
+        # Initialize dictionary with zeros
+        mo = {k: 0.0 for k in ['m00', 'm10', 'm01', 'm20', 'm11', 'm02', 'm30', 'm21', 'm12', 'm03',
+                               'mu20', 'mu11', 'mu02', 'mu30', 'mu21', 'mu12', 'mu03',
+                               'nu20', 'nu11', 'nu02', 'nu30', 'nu21', 'nu12', 'nu03']}
+        
+        if n < 3:
+            return mo
+        
+        x = pts[:, 0]
+        y = pts[:, 1]
+        x_next = np.roll(x, -1)
+        y_next = np.roll(y, -1)
+        
+        # Standard Shoelace component
+        a = x * y_next - x_next * y
+        signed_area = 0.5 * np.sum(a)
+        
+        if abs(signed_area) < 1e-9:
+            return mo
+
+        # Calculate spatial moments
+        # We take the absolute of the final sum for m00 to match OpenCV's non-oriented behavior
+        mo["m00"] = abs(signed_area)
+        
+        # m10 and m01 must be adjusted by the sign of the area to remain consistent
+        # regardless of clockwise or counter-clockwise point ordering.
+        area_sign = 1.0 if signed_area > 0 else -1.0
+        
+        mo["m10"] = (1/6) * np.sum((x + x_next) * a) * area_sign
+        mo["m01"] = (1/6) * np.sum((y + y_next) * a) * area_sign
+        
+        # Note: If you need m20, m02, etc., they also require the area_sign adjustment.
+        
+        return mo
     
     @staticmethod
     def getPerspectiveTransform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:

@@ -177,13 +177,13 @@ def process_frame(frame):
     post_blur = time()
     # print(f"Gaussian Blur Time: {post_blur - post_gray:.4f} seconds")
     
-    # thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-    #                                CustomCV2.THRESH_BINARY_INV, 11, 5)
+    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   CustomCV2.THRESH_BINARY_INV, 11, 10)
+
+    # thresh = CustomCV2.Sobel(blurred, 155)
 
     # thresh = CustomCV2.threshold(blurred, 155, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
-    thresh = CustomCV2.adaptiveThresholdMaskAware(
-        blurred, 255, 11, 5
-    )
+
     post_thresh = time()
     cv2.imshow("Thresholded", thresh)
     # print(f"Adaptive Thresholding Time: {post_thresh - post_blur:.4f} seconds")
@@ -196,14 +196,28 @@ def process_frame(frame):
     processed_centers = []
 
     for cnt in contours:
-        if cv2.contourArea(cnt) < 1000:
+        if CustomCV2.contourArea(cnt) < 1000:
             continue
         
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        peri = CustomCV2.arcLength(cnt, True)
+        # quad = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        quad = CustomCV2.approxPolyDP(cnt, 0.04 * peri, True)
+        # print("-------")
+        # print(quad_cv2)
+        # print("=======")
+        # print(quad)
+        # print("-------")
+        # print(quad.shape, type(quad))
+        # print(quad_cv2.shape, type(quad_cv2))
+        # print(len(quad), len(quad_cv2))
+        # print(cv2.isContourConvex(quad_cv2), cv2.isContourConvex(quad))
+        # print("-------")
+        # cv2.drawContours(frame, [quad], -1, (255, 0, 0), 2)
 
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            M = cv2.moments(cnt)
+        # quad = CustomCV2.findCornersQuadrilateral(cnt)
+        
+        if len(quad) == 4 and CustomCV2.isContourConvex(quad):
+            M = CustomCV2.moments(quad)
             if M["m00"] == 0:
                 continue
             cX, cY = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
@@ -211,7 +225,7 @@ def process_frame(frame):
             if any(math.hypot(cX - pc[0], cY - pc[1]) < 20 for pc in processed_centers):
                 continue
 
-            rect = order_points(approx)
+            rect = order_points(quad)
             rect = refine_corners(gray, rect)
             
             side = 160
