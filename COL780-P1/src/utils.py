@@ -229,10 +229,10 @@ def process_frame(frame):
             rect = order_points(quad)
             rect = refine_corners(gray, rect)
             
-            side = 160
+            side = 400
             dst_pts = np.array([[0, 0], [side - 1, 0], [side - 1, side - 1], [0, side - 1]], dtype="float32")
-            H = cv2.getPerspectiveTransform(rect, dst_pts)
-            warped = cv2.warpPerspective(gray, H, (side, side))
+            H = CustomCV2.getPerspectiveTransform(rect, dst_pts)
+            warped = CustomCV2.warpPerspective(gray, H, (side, side))
 
             result = decode_tag(warped)
             

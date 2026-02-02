@@ -69,6 +69,7 @@ class CustomCV2:
         pad_h = ky // 2
         pad_w = kx // 2
         return np.pad(res, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge').astype(src.dtype)
+
     @staticmethod
     def _make_gaussian_kernel(ksize: int, sigmaX: float) -> np.ndarray:
         ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
@@ -522,33 +523,134 @@ class CustomCV2:
     @staticmethod
     def getPerspectiveTransform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
         """
-        Calculate perspective transformation matrix.
-        
-        Args:
-            src: Coordinates of 4 source points
-            dst: Coordinates of 4 destination points
-            
-        Returns:
-            3x3 perspective transformation matrix
+        Calculates the 3x3 perspective transform matrix (Homography) 
+        that maps points 'src' to 'dst'.
+        Solves the system: dst_i = M * src_i
         """
-        raise NotImplementedError("getPerspectiveTransform needs implementation")
+        if src.shape != (4, 2) or dst.shape != (4, 2):
+            raise ValueError("Source and Destination must contain exactly 4 points")
+
+        # We need to solve for 8 coefficients (h22 is fixed to 1)
+        # The system is Ah = b
+        A = np.zeros((8, 8), dtype=np.float64)
+        b = np.zeros((8), dtype=np.float64)
+
+        for i in range(4):
+            x, y = src[i]
+            u, v = dst[i]
+            
+            # Equation 1 for x-coordinate (u)
+            # h00*x + h01*y + h02 - h20*x*u - h21*y*u = u
+            A[2*i] = [x, y, 1, 0, 0, 0, -x*u, -y*u]
+            b[2*i] = u
+            
+            # Equation 2 for y-coordinate (v)
+            # h10*x + h11*y + h12 - h20*x*v - h21*y*v = v
+            A[2*i+1] = [0, 0, 0, x, y, 1, -x*v, -y*v]
+            b[2*i+1] = v
+
+        # Solve linear system
+        try:
+            h = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return np.eye(3)
+
+        # Reshape to 3x3 matrix (append h22 = 1)
+        M = np.append(h, 1.0).reshape(3, 3)
+        return M
     
     @staticmethod
     def warpPerspective(src: np.ndarray, M: np.ndarray, dsize: Tuple[int, int],
                        flags: int = INTER_LINEAR) -> np.ndarray:
         """
-        Apply perspective transformation to image.
-        
-        Args:
-            src: Input image
-            M: 3x3 transformation matrix
-            dsize: Size of output image
-            flags: Interpolation method
-            
-        Returns:
-            Warped image
+        Applies perspective transformation using Backward Mapping (Inverse warping).
+        Vectorized for performance (avoids slow Python loops).
         """
-        raise NotImplementedError("warpPerspective needs implementation")
+        width, height = dsize
+        
+        # 1. Invert the matrix because we need to map Destination(x,y) -> Source(u,v)
+        # to interpolate pixel values.
+        try:
+            M_inv = np.linalg.inv(M)
+        except np.linalg.LinAlgError:
+            return np.zeros((height, width), dtype=src.dtype)
+
+        # 2. Create a grid of coordinates for the Destination image
+        # x_coords: [[0, 1, 2...], [0, 1, 2...]]
+        # y_coords: [[0, 0, 0...], [1, 1, 1...]]
+        x_idxs, y_idxs = np.meshgrid(np.arange(width), np.arange(height))
+        
+        # 3. Apply Perspective Equation to the grid: 
+        # src_x = (m00*x + m01*y + m02) / (m20*x + m21*y + m22)
+        # src_y = (m10*x + m11*y + m12) / (m20*x + m21*y + m22)
+        
+        # Pre-extract matrix values for speed
+        h00, h01, h02 = M_inv[0]
+        h10, h11, h12 = M_inv[1]
+        h20, h21, h22 = M_inv[2]
+
+        # Calculate denominator (w')
+        denom = h20 * x_idxs + h21 * y_idxs + h22
+        # Avoid division by zero
+        denom[denom == 0] = 1e-9
+        
+        # Calculate source coordinates
+        src_x = (h00 * x_idxs + h01 * y_idxs + h02) / denom
+        src_y = (h10 * x_idxs + h11 * y_idxs + h12) / denom
+        
+        # 4. Bilinear Interpolation (Vectorized)
+        h_src, w_src = src.shape[:2]
+        
+        # Get integer and fractional parts
+        x0 = np.floor(src_x).astype(np.int32)
+        y0 = np.floor(src_y).astype(np.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        
+        # Calculate weights
+        dx = src_x - x0
+        dy = src_y - y0
+        
+        # Clamp coordinates to image bounds
+        x0 = np.clip(x0, 0, w_src - 1)
+        x1 = np.clip(x1, 0, w_src - 1)
+        y0 = np.clip(y0, 0, h_src - 1)
+        y1 = np.clip(y1, 0, h_src - 1)
+        
+        # Sample pixels
+        # If image is grayscale (2D) vs Color (3D)
+        if src.ndim == 2:
+            Ia = src[y0, x0]
+            Ib = src[y1, x0]
+            Ic = src[y0, x1]
+            Id = src[y1, x1]
+            
+            # Bilinear Formula: 
+            # val = Ia*(1-dx)(1-dy) + Ib*(1-dx)dy + Ic*dx(1-dy) + Id*dx*dy
+            wa = (1 - dx) * (1 - dy)
+            wb = (1 - dx) * dy
+            wc = dx * (1 - dy)
+            wd = dx * dy
+            
+            warped = (Ia * wa + Ib * wb + Ic * wc + Id * wd)
+            
+        else:
+            # For 3 Channel images, operations broadcast automatically
+            Ia = src[y0, x0]
+            Ib = src[y1, x0]
+            Ic = src[y0, x1]
+            Id = src[y1, x1]
+            
+            wa = (1 - dx) * (1 - dy)
+            wb = (1 - dx) * dy
+            wc = dx * (1 - dy)
+            wd = dx * dy
+            
+            # Reshape weights for broadcasting: (H, W) -> (H, W, 1)
+            warped = (Ia * wa[..., None] + Ib * wb[..., None] + 
+                      Ic * wc[..., None] + Id * wd[..., None])
+
+        return warped.astype(np.uint8)
     
     @staticmethod
     def cornerSubPix(image: np.ndarray, corners: np.ndarray, winSize: Tuple[int, int],
