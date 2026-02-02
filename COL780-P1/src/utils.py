@@ -173,12 +173,13 @@ def process_frame(frame):
     # print(f"Grayscale Conversion Time: {post_gray - pre_gray:.4f} seconds")
 
 
-    blurred = CustomCV2.GaussianBlur(gray, (3, 3), 50)
+    # blurred = CustomCV2.GaussianBlur(gray, (3, 3), 50)
+    blurred = CustomCV2.BoxFilter(gray, (3, 3))
     post_blur = time()
     # print(f"Gaussian Blur Time: {post_blur - post_gray:.4f} seconds")
     
-    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   CustomCV2.THRESH_BINARY_INV, 11, 10)
+    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
+                                   CustomCV2.THRESH_BINARY_INV, 11, 7)
 
     # thresh = CustomCV2.Sobel(blurred, 155)
 

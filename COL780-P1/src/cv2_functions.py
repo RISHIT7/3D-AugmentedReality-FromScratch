@@ -9,6 +9,7 @@ class CustomCV2:
     THRESH_BINARY_INV = 1
     THRESH_OTSU = 8
     ADAPTIVE_THRESH_GAUSSIAN_C = 1
+    ADAPTIVE_THRESH_MEAN_C = 0
     RETR_TREE = 3
     RETR_EXTERNAL = 0
     CHAIN_APPROX_SIMPLE = 2
@@ -44,6 +45,30 @@ class CustomCV2:
         else:
             raise NotImplementedError("cvtColor code not implemented")
 
+    @staticmethod
+    def BoxFilter(src: np.ndarray, ksize: Tuple[int, int]) -> np.ndarray:
+        """
+        Highly optimized Box Filter using moving sums (O(1) per pixel relative to kernel size).
+        """
+        kx, ky = ksize
+        # Ensure source is float for precision during accumulation
+        res = src.astype(np.float32)
+        
+        # 1. Horizontal Box Sum
+        # cumsum + slice-subtraction is significantly faster than np.convolve
+        res = np.cumsum(res, axis=1)
+        res[:, kx:] = res[:, kx:] - res[:, :-kx]
+        res = res[:, kx-1:] / kx
+        
+        # 2. Vertical Box Sum
+        res = np.cumsum(res, axis=0)
+        res[ky:, :] = res[ky:, :] - res[:-ky, :]
+        res = res[ky-1:, :] / ky
+
+        # Padding to maintain 'same' mode to match your current implementation
+        pad_h = ky // 2
+        pad_w = kx // 2
+        return np.pad(res, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge').astype(src.dtype)
     @staticmethod
     def _make_gaussian_kernel(ksize: int, sigmaX: float) -> np.ndarray:
         ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
@@ -204,30 +229,52 @@ class CustomCV2:
     @staticmethod
     def adaptiveThreshold(src: np.ndarray, maxValue: float, adaptiveMethod: int,
                          thresholdType: int, blockSize: int, C: float) -> np.ndarray:
-        h, w = src.shape
-        half = blockSize // 2
-        
-        integral = np.pad(src.astype(np.float64).cumsum(axis=0).cumsum(axis=1), 
-                         ((1, 1), (1, 1)), mode='edge') 
-        
-        y = np.arange(h)
-        x = np.arange(w)
-        
-        y1 = np.maximum(0, y - half)
-        y2 = np.minimum(h, y + half + 1)
-        x1 = np.maximum(0, x - half)
-        x2 = np.minimum(w, x + half + 1)
-
-        block_sum = (integral[y2[:, None], x2] - integral[y1[:, None], x2] - 
-                    integral[y2[:, None], x1] + integral[y1[:, None], x1])
-
-        counts = (y2[:, None] - y1[:, None]) * (x2 - x1)
-        local_thresh = (block_sum / counts) - C
-        
-        if thresholdType == CustomCV2.THRESH_BINARY_INV:
-            output = np.where(src > local_thresh, 0, maxValue)
+        """
+        Applies adaptive thresholding.
+        Supports both ADAPTIVE_THRESH_MEAN_C (via Integral Image) and 
+        ADAPTIVE_THRESH_GAUSSIAN_C (via Convolution).
+        """
+        if blockSize % 2 == 0:
+            blockSize += 1  # Block size must be odd
+            
+        if adaptiveMethod == CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C:
+            # OpenCV formula to derive sigma from ksize if not provided
+            sigma = 0.3 * ((blockSize - 1) * 0.5 - 1) + 0.8
+            mean = CustomCV2.GaussianBlur(src, (blockSize, blockSize), sigma)
+            # Depending on precision, we might want mean to be float
+            mean = mean.astype(np.float32)
+            
         else:
-            output = np.where(src > local_thresh, maxValue, 0)
+            # ADAPTIVE_THRESH_MEAN_C
+            # Use the fast Integral Image (Box Filter) approach
+            h, w = src.shape
+            half = blockSize // 2
+            
+            # Pad and compute integral image
+            integral = np.pad(src.astype(np.float64).cumsum(axis=0).cumsum(axis=1), 
+                             ((1, 1), (1, 1)), mode='edge') 
+            
+            y = np.arange(h)
+            x = np.arange(w)
+            
+            y1 = np.maximum(0, y - half)
+            y2 = np.minimum(h, y + half + 1)
+            x1 = np.maximum(0, x - half)
+            x2 = np.minimum(w, x + half + 1)
+
+            block_sum = (integral[y2[:, None], x2] - integral[y1[:, None], x2] - 
+                        integral[y2[:, None], x1] + integral[y1[:, None], x1])
+
+            counts = (y2[:, None] - y1[:, None]) * (x2 - x1)
+            mean = (block_sum / counts)
+
+        # Apply the threshold calculation: T(x,y) = mean(x,y) - C
+        diff = src.astype(np.float32) - (mean - C)
+
+        if thresholdType == CustomCV2.THRESH_BINARY_INV:
+            output = np.where(diff <= 0, maxValue, 0)
+        else:
+            output = np.where(diff > 0, maxValue, 0)
             
         return output.astype(np.uint8)
 
