@@ -2,7 +2,21 @@ import numpy as np
 from typing import Tuple, List, Optional, Any
 import math
 
+import sys
+import os
+
+# Add parent directory to path to find the compiled module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    import custom_cv2_cpp # type: ignore
+    CPP_AVAILABLE = True
+except ImportError as e:
+    CPP_AVAILABLE = False
+
 GRAY_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+MIN_CONTOUR_POINTS = 10
+print(CPP_AVAILABLE)
 
 class CustomCV2:
     THRESH_BINARY = 0
@@ -281,8 +295,13 @@ class CustomCV2:
 
     @staticmethod
     def findContours(image: np.ndarray, mode: int = 0, method: int = 1) -> List[np.ndarray]:
+
         binary = (image > 0).astype(np.uint8)
         binary = np.pad(binary, 1, mode='constant', constant_values=0)
+
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.findContours_cpp(binary, MIN_CONTOUR_POINTS), None
+
         h, w = binary.shape
         
         visited = np.zeros_like(binary, dtype=bool)
@@ -326,7 +345,6 @@ class CustomCV2:
                         
                         if len(contour_pts) > 2:
                             contours.append(np.array(contour_pts, dtype=np.int32).reshape(-1, 1, 2))
-
         return contours, None    
 
     @staticmethod
@@ -567,7 +585,9 @@ class CustomCV2:
         Vectorized for performance (avoids slow Python loops).
         """
         width, height = dsize
-        
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.warpPerspective_cpp(src, M, width, height)
+
         # 1. Invert the matrix because we need to map Destination(x,y) -> Source(u,v)
         # to interpolate pixel values.
         try:

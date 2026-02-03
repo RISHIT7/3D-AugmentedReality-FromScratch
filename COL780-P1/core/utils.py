@@ -215,13 +215,13 @@ def process_frame(frame):
     pre_gray = time()
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
     post_gray = time()
-    # print(f"Grayscale Conversion Time: {post_gray - pre_gray:.4f} seconds")
+    print(f"Grayscale Conversion Time: {post_gray - pre_gray:.4f} seconds")
 
 
     # blurred = CustomCV2.GaussianBlur(gray, (3, 3), 50)
     blurred = CustomCV2.BoxFilter(gray, (3, 3))
     post_blur = time()
-    # print(f"Gaussian Blur Time: {post_blur - post_gray:.4f} seconds")
+    print(f"Gaussian Blur Time: {post_blur - post_gray:.4f} seconds")
     
     thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
                                    CustomCV2.THRESH_BINARY_INV, 11, 7)
@@ -232,11 +232,11 @@ def process_frame(frame):
 
     post_thresh = time()
     cv2.imshow("Thresholded", thresh)
-    # print(f"Adaptive Thresholding Time: {post_thresh - post_blur:.4f} seconds")
+    print(f"Adaptive Thresholding Time: {post_thresh - post_blur:.4f} seconds")
 
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
     post_contours = time()
-    # print(f"Contour Detection Time: {post_contours - post_thresh:.4f} seconds")
+    print(f"Contour Detection Time: {post_contours - post_thresh:.4f} seconds")
 
     raw_candidates = []
     processed_centers = []
@@ -278,7 +278,10 @@ def process_frame(frame):
             # rect = refine_corners(gray, rect)
             
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
+            pre_warp = time()
             warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
+            post_warp = time()
+            print(f"Warp Perspective Time: {post_warp - pre_warp:.4f} seconds")
 
             result = decode_tag(warped)
             

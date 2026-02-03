@@ -3,3 +3,9 @@
 2) https://docs.opencv.org/4.x/d7/d4d/tutorial_py_thresholding.html
 
 3) https://en.wikipedia.org/wiki/Otsu%27s_method
+
+4) pybind
+
+
+-----
+- warp prespective
