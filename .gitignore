@@ -7,3 +7,4 @@ assets/*
 *.mp4
 *.pyc
 __pycache__/
+*.so
