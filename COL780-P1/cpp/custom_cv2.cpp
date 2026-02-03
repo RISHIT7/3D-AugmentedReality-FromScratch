@@ -13,6 +13,12 @@ inline uint8_t clip_u8(float val) {
     return (val < 0.0f) ? 0 : (val > 255.0f) ? 255 : static_cast<uint8_t>(val);
 }
 
+inline double get_dist_sq(int x1, int y1, int x2, int y2) {
+    double dx = static_cast<double>(x1) - static_cast<double>(x2);
+    double dy = static_cast<double>(y1) - static_cast<double>(y2);
+    return dx * dx + dy * dy;
+}
+
 void invert_3x3(const double* mat, double* invMat) {
     double det = mat[0] * (mat[4] * mat[8] - mat[5] * mat[7]) -
                  mat[1] * (mat[3] * mat[8] - mat[5] * mat[6]) +
@@ -36,6 +42,50 @@ void invert_3x3(const double* mat, double* invMat) {
     invMat[6] = (mat[3] * mat[7] - mat[4] * mat[6]) * invDet;
     invMat[7] = (mat[1] * mat[6] - mat[0] * mat[7]) * invDet;
     invMat[8] = (mat[0] * mat[4] - mat[1] * mat[3]) * invDet;
+}
+
+double perpendicular_distance(int x, int y, int x1, int y1, int x2, int y2) {
+    double l2 = get_dist_sq(x1, y1, x2, y2);
+    if (l2 < 1e-9) {
+        return std::sqrt(get_dist_sq(x, y, x1, y1));
+    }
+
+    double t = (static_cast<double>(x - x1) * (x2 - x1) + 
+                static_cast<double>(y - y1) * (y2 - y1)) / l2;
+    t = std::max(0.0, std::min(1.0, t));
+
+    double proj_x = x1 + t * (x2 - x1);
+    double proj_y = y1 + t * (y2 - y1);
+
+    double dx = x - proj_x;
+    double dy = y - proj_y;
+
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+void dp_recursive(const std::vector<std::array<int, 2>>& points, int start, int end, double epsilon, std::vector<bool>& keep) {
+    if (end <= start + 1) {
+        return;
+    }
+
+    double max_dist = 0.0;
+    int index = start;
+
+    for (int i = start + 1; i < end; i++) {
+        double dist = perpendicular_distance(points[i][0], points[i][1],
+                                             points[start][0], points[start][1],
+                                             points[end][0], points[end][1]);
+        if (dist > max_dist) {
+            index = i;
+            max_dist = dist;
+        }
+    }
+
+    if (max_dist > epsilon) {
+        keep[index] = true;
+        dp_recursive(points, start, index, epsilon, keep);
+        dp_recursive(points, index, end, epsilon, keep);
+    }
 }
 
 py::array_t<uint8_t> warpPerspective_cpp(const py::array_t<uint8_t> src, const py::array_t<double> M, int d_w, int d_h) {
@@ -166,6 +216,68 @@ py::list findContours_cpp(const py::array_t<uint8_t> src, int min_points) {
     return contours;
 }
 
+py::array_t<int> approxPolyDP_cpp(const py::array_t<int>& curve, double epsilon, bool closed = false) {
+    auto buf_curve = curve.request();
+    if (buf_curve.ndim != 3 || buf_curve.shape[1] != 1 || buf_curve.shape[2] != 2) {
+        throw std::runtime_error("Input curve must have shape (N, 1, 2)");
+    }
+
+    int n_points = buf_curve.shape[0];
+    if (n_points < 3) {
+        return curve;
+    }
+    auto r_curve = curve.unchecked<3>();
+
+    std::vector<std::array<int, 2>> points(n_points);
+    for (int i = 0; i < n_points; i++) {
+        points[i][0] = r_curve(i, 0, 0);
+        points[i][1] = r_curve(i, 0, 1);
+    }
+
+    std::vector<bool> keep(n_points, false);
+    keep[0] = true;
+    keep[n_points - 1] = true;
+
+    dp_recursive(points, 0, n_points - 1, epsilon, keep);
+
+    std::vector<std::array<int, 2>> result_points;
+    result_points.reserve(n_points);
+    for (int i = 0; i < n_points; i++) {
+        if (keep[i]) {
+            result_points.push_back(points[i]);
+        }
+    }
+
+    if (closed && result_points.size() > 1) {
+        auto& first = result_points[0];
+        auto& last = result_points[result_points.size() - 1];
+
+        double dx = std::abs(static_cast<double>(first[0]) - static_cast<double>(last[0]));
+        double dy = std::abs(static_cast<double>(first[1]) - static_cast<double>(last[1]));
+        if (dx <= 1.0 && dy <= 1.0) {
+            result_points.pop_back();
+        }
+    }
+
+    if (result_points.size() < 3) {
+        result_points.clear();
+        for (int i = 0; i < n_points; i++) {
+            if (keep[i]) {
+                result_points.push_back(points[i]);
+            }
+        }
+    }
+
+    py::array_t<int> result_array({static_cast<int>(result_points.size()), 1, 2});
+    auto r_result = result_array.mutable_unchecked<3>();
+    for (size_t i = 0; i < result_points.size(); i++) {
+        r_result(i, 0, 0) = result_points[i][0];
+        r_result(i, 0, 1) = result_points[i][1];
+    }
+
+    return result_array;
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -176,4 +288,8 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("findContours_cpp", &findContours_cpp, 
           py::arg("src"), py::arg("min_points") = 10,
           "Finds contours in a binary image and returns those with number of points >= min_points.");
+
+    m.def("approxPolyDP_cpp", &approxPolyDP_cpp, 
+          py::arg("curve"), py::arg("epsilon"), py::arg("closed") = false,
+          "Approximates a polygonal curve with the specified precision epsilon using the Douglas-Peucker algorithm.");
 }

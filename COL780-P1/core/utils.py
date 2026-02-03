@@ -235,8 +235,6 @@ def process_frame(frame):
     print(f"Adaptive Thresholding Time: {post_thresh - post_blur:.4f} seconds")
 
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
-    post_contours = time()
-    print(f"Contour Detection Time: {post_contours - post_thresh:.4f} seconds")
 
     raw_candidates = []
     processed_centers = []
@@ -245,9 +243,14 @@ def process_frame(frame):
         if CustomCV2.contourArea(cnt) < MIN_TAG_AREA:
             continue
         
+        pre_peri = time()
         peri = CustomCV2.arcLength(cnt, True)
+        post_peri = time()
+        print(f"Contour Perimeter Time: {post_peri - pre_peri:.4f} seconds")
         # quad = cv2.approxPolyDP(cnt, 0.02 * peri, True)
         quad = CustomCV2.approxPolyDP(cnt, 0.02 * peri, True)
+        post_approx = time()
+        print(f"Contour Approximation Time: {post_approx - post_peri:.4f} seconds")
         # print("-------")
         # print(quad_cv2)
         # print("=======")
@@ -276,12 +279,11 @@ def process_frame(frame):
 
             rect = order_points(quad)
             # rect = refine_corners(gray, rect)
-            
+            pre_perspective = time()
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
-            pre_warp = time()
+            post_perspective = time()
+            print(f"Perspective Transform Time: {post_perspective - pre_perspective:.4f} seconds")
             warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
-            post_warp = time()
-            print(f"Warp Perspective Time: {post_warp - pre_warp:.4f} seconds")
 
             result = decode_tag(warped)
             

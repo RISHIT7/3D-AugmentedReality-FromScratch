@@ -20,7 +20,8 @@ def main():
     if not cap.isOpened():
         print(f"Error opening source: {video_source}")
         return
-        
+    
+    run_twice = 2
     while cap.isOpened():
         if not paused:
             ret, frame = cap.read()
@@ -41,6 +42,11 @@ def main():
             cv2.waitKey(0)
         if key == ord('r'):
             paused = False
+
+        if run_twice > 0:
+            run_twice -= 1
+        else:
+            break
 
     cap.release()
     cv2.destroyAllWindows()

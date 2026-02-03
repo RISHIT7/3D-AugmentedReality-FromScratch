@@ -413,6 +413,8 @@ class CustomCV2:
     
     @staticmethod
     def approxPolyDP(curve: np.ndarray, epsilon: float, closed: bool) -> np.ndarray:
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.approxPolyDP_cpp(curve, epsilon, closed)
         if curve.ndim == 3:
             pts = curve.reshape(-1, 2).copy()
         else:
