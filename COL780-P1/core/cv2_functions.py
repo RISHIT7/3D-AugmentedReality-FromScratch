@@ -600,6 +600,8 @@ class CustomCV2:
         
         # 4. Bilinear Interpolation (Vectorized)
         h_src, w_src = src.shape[:2]
+        src_x = np.clip(src_x, 0, w_src - 1)
+        src_y = np.clip(src_y, 0, h_src - 1)
         
         # Get integer and fractional parts
         x0 = np.floor(src_x).astype(np.int32)

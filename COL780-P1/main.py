@@ -1,8 +1,8 @@
 import cv2 # OpenCV - Only for video capture and display
 import argparse
-from utils import * # Define custom CV functions in utils.py
+from core.utils import * # Define custom CV functions in utils.py
 
-from evaluate import Evaluator
+from core.evaluate import Evaluator
 
 def main():
     parser = argparse.ArgumentParser(description="AR Tag Detection and Overlay")
@@ -27,7 +27,7 @@ def main():
             if not ret:
                 break
             
-        processed_frame, tag_data_list = process_frame(frame.copy())
+        processed_frame, tag_data_list = process_frame(frame)
         evaluator.update(tag_data_list)
 
         display_frame = evaluator.draw_stats(processed_frame)
@@ -41,9 +41,6 @@ def main():
             cv2.waitKey(0)
         if key == ord('r'):
             paused = False
-        if key == ord('q'):  
-            break
-
 
     cap.release()
     cv2.destroyAllWindows()
