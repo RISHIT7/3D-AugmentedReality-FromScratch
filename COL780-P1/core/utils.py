@@ -4,6 +4,19 @@ import numpy as np
 import math
 from time import time
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    import custom_cv2_cpp # type: ignore
+    CPP_AVAILABLE = True
+except ImportError as e:
+    CPP_AVAILABLE = False
+
+print(CPP_AVAILABLE)
+
+
 class TemporalFilter:
     def __init__(self, persistence=4):
         self.persistence = persistence
@@ -137,6 +150,8 @@ def decode_tag(warped_tag: np.ndarray):
     Returns:
         (tag_id, orientation) or (None, None) if invalid
     """
+    if CPP_AVAILABLE:
+        return custom_cv2_cpp.decode_tag_cpp(warped_tag)
     # Threshold the image
     _, thresh = CustomCV2.threshold(warped_tag, 155, 255, CustomCV2.THRESH_BINARY)
     side = thresh.shape[0]
@@ -150,25 +165,24 @@ def decode_tag(warped_tag: np.ndarray):
     margin = min(margin, side // 4)  # Safety clamp
     
     # Vectorized border sampling
-    indices = np.clip(((np.arange(8) + 0.5) * cell).astype(int), 0, side - 1)
+    # indices = np.clip(((np.arange(8) + 0.5) * cell).astype(int), 0, side - 1)
     
-    border_samples = np.concatenate([
-        thresh[margin, indices],
-        thresh[indices, side - margin - 1],
-        thresh[side - margin - 1, indices][::-1],
-        thresh[indices, margin][::-1]
-    ])
+    # border_samples = np.concatenate([
+    #     thresh[margin, indices],
+    #     thresh[indices, side - margin - 1],
+    #     thresh[side - margin - 1, indices][::-1],
+    #     thresh[indices, margin][::-1]
+    # ])
     
-    # Check border (should be black)
-    if np.any(border_samples > 150):
-        return None, None
+    # # Check border (should be black)
+    # if np.any(border_samples > 150):
+    #     return None, None
 
     # Extract core region
     start = int(CORE_START_CELL * cell)
     end = int(CORE_END_CELL * cell)
     core_size = end - start
     core_cell = core_size / 4.0
-    
     def get_core_val(r: int, c: int) -> float:
         """Sample center 40% of a core cell"""
         y_start = max(0, int(start + (r + 0.3) * core_cell))
@@ -244,12 +258,22 @@ def process_frame(frame):
                 dists = np.sum((centers_array - np.array([cX, cY]))**2, axis=1)
                 if np.any(dists < CENTER_PROXIMITY_THRESH_SQUARED):
                     continue
-
+            
+            pre_order = time()
             rect = order_points(quad)
+            post_order = time()
+            print(f"Ordering Time: {(post_order - pre_order)*1000:.3f} ms")
             # rect = refine_corners(gray, rect)
+
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
+            post_H = time()
+            print(f"H Matrix Time: {(post_H - post_order)*1000:.3f} ms")
             warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
+            post_warp = time()
+            print(f"Warp Time: {(post_warp - post_H)*1000:.3f} ms")
             result = decode_tag(warped)
+            post_decode = time()
+            print(f"Decode Time: {(post_decode - post_warp)*1000:.3f} ms")
             
             if result[0] is not None:
                 tag_id, orient_idx = result

@@ -9,6 +9,32 @@
 
 namespace py = pybind11;
 
+inline int sample_cell(const uint8_t* img,  const int start, const float cell_size, const int r, const int c, const int side) {
+    int y_s = static_cast<int>(start + (r + 0.3f) * cell_size);
+    int x_s = static_cast<int>(start + (c + 0.3f) * cell_size);
+    int y_e = static_cast<int>(start + (r + 0.7f) * cell_size);
+    int x_e = static_cast<int>(start + (c + 0.7f) * cell_size);
+
+    y_s = std::max(y_s, 0);
+    x_s = std::max(x_s, 0);
+    y_e = std::min(y_e, side);
+    x_e = std::min(x_e, side);
+
+    if (y_s >= y_e || x_s >= x_e) {
+        return 0;
+    }
+
+    int sum = 0;
+    int count = 0;
+    for (int y = y_s; y < y_e; y++) {
+        for (int x = x_s; x < x_e; x++) {
+            sum += img[y * side + x];
+            count++;
+        }
+    }
+    return (count == 0) ? 0 : (sum / count);
+}
+
 inline uint8_t clip_u8(float val) {
     return (val < 0.0f) ? 0 : (val > 255.0f) ? 255 : static_cast<uint8_t>(val);
 }
@@ -462,6 +488,75 @@ py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
     return result;
 }
 
+py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
+    auto buf_warped = warped.request();
+    int SIDE = buf_warped.shape[0];
+    // if (SIDE < 64) {
+    //     return py::make_tuple(py::none(), py::none());
+    // }
+
+    const uint8_t* raw_warped = (uint8_t*)buf_warped.ptr;
+
+    float cell_size = static_cast<float>(SIDE) / 8.0f;
+    int margin  = (int)(cell_size / 2);
+    if (margin < 1) margin = 1;
+
+    int border_threshold = 150;
+
+    for (int i = 0; i < 8; i++) {
+        int idx = (int) (( i + 0.5f) * cell_size);
+        if (raw_warped[margin * SIDE + idx] > border_threshold) return py::make_tuple(py::none(), py::none());
+        if (raw_warped[(SIDE - 1 - margin) * SIDE + idx] > border_threshold) return py::make_tuple(py::none(), py::none());
+    }   
+
+    for (int i = 0; i < 8; i++) {
+        int idx = (int) (( i + 0.5f) * cell_size);
+        if (raw_warped[idx * SIDE + margin] > border_threshold) return py::make_tuple(py::none(), py::none());
+        if (raw_warped[idx * SIDE + (SIDE - 1 - margin)] > border_threshold) return py::make_tuple(py::none(), py::none());
+    }
+
+    int start = (int) (2 * cell_size);
+    int end = (int) ((6) * cell_size);
+    float core_cell = (end - start) / 4.0f;
+
+    int anchors[4];
+    anchors[0] = sample_cell(raw_warped, start, core_cell, 3, 3, SIDE);
+    anchors[1] = sample_cell(raw_warped, start, core_cell, 3, 0, SIDE);
+    anchors[2] = sample_cell(raw_warped, start, core_cell, 0, 0, SIDE);
+    anchors[3] = sample_cell(raw_warped, start, core_cell, 0, 3, SIDE);
+
+    int max_val = -1;
+    int status = -1;
+    for (int i = 0; i < 4; i++) {
+        if (anchors[i] > max_val) {
+            max_val = anchors[i];
+            status = i;
+        }
+    }
+
+    if (max_val < 127) {
+        return py::make_tuple(py::none(), py::none());
+    }
+
+    int bit_map[4][4][2] = {
+        {{1, 1}, {1, 2}, {2, 2}, {2, 1}},
+        {{1, 2}, {2, 2}, {2, 1}, {1, 1}},
+        {{2, 2}, {2, 1}, {1, 1}, {1, 2}},
+        {{2, 1}, {1, 1}, {1, 2}, {2, 2}}
+    };
+
+    int tag_id = 0;
+    for (int r = 0; r < 4; r++) {
+        int br = bit_map[status][r][0];
+        int bc = bit_map[status][r][1];
+
+        int val = sample_cell(raw_warped, start, core_cell, br, bc, SIDE);
+        int bit = (val > 127) ? 1 : 0;
+        tag_id |= (bit << r);
+    }
+    return py::make_tuple(tag_id, status);
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -492,5 +587,8 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("cvtColor_cpp", &cvtColor_cpp,
           py::arg("src"),
           "Converts a BGR image to grayscale.");
-
+    
+    m.def("decode_tag_cpp", &decode_tag_cpp,
+          py::arg("warped"),
+          "Decodes a tag from a warped grayscale image and returns the tag ID and orientation status.");
 }
