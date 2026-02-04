@@ -13,7 +13,9 @@ try:
 except ImportError as e:
     CPP_AVAILABLE = False
 
-GRAY_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+# GRAY_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+GRAY_WEIGHTS = np.array([0.3333, 0.3333, 0.3333], dtype=np.float32) # max entropy
+# GRAY_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 MIN_CONTOUR_POINTS = 10
 print(CPP_AVAILABLE)
 

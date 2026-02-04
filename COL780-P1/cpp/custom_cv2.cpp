@@ -510,7 +510,7 @@ py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
         uint8_t* dst_row_ptr = raw_dst + y * s_w;
 
         for (int x = 0; x < s_w; x++) {
-            float gray = 0.299f * row_ptr[x * 3 + 2] + 0.587f * row_ptr[x * 3 + 1] + 0.114f * row_ptr[x * 3 + 0];
+            float gray = 0.333f * row_ptr[x * 3 + 2] + 0.333f * row_ptr[x * 3 + 1] + 0.333f * row_ptr[x * 3 + 0];
             dst_row_ptr[x] = clip_u8(gray);
         }
     }

@@ -1,4 +1,5 @@
 import cv2
+from matplotlib.pyplot import gray
 from core.cv2_functions import CustomCV2
 import numpy as np
 import math
@@ -218,18 +219,18 @@ def decode_tag(warped_tag: np.ndarray):
     margin = min(margin, side // 4)  # Safety clamp
     
     # Vectorized border sampling
-    # indices = np.clip(((np.arange(8) + 0.5) * cell).astype(int), 0, side - 1)
+    indices = np.clip(((np.arange(8) + 0.5) * cell).astype(int), 0, side - 1)
     
-    # border_samples = np.concatenate([
-    #     thresh[margin, indices],
-    #     thresh[indices, side - margin - 1],
-    #     thresh[side - margin - 1, indices][::-1],
-    #     thresh[indices, margin][::-1]
-    # ])
+    border_samples = np.concatenate([
+        thresh[margin, indices],
+        thresh[indices, side - margin - 1],
+        thresh[side - margin - 1, indices][::-1],
+        thresh[indices, margin][::-1]
+    ])
     
-    # # Check border (should be black)
-    # if np.any(border_samples > 150):
-    #     return None, None
+    # Check border (should be black)
+    if np.any(border_samples > 150):
+        return None, None
 
     # Extract core region
     start = int(CORE_START_CELL * cell)
@@ -281,14 +282,16 @@ def process_frame(frame):
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 # 3% of frame
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
-
     # blurred = CustomCV2.GaussianBlur(gray, (3, 3), 50)
     blurred = CustomCV2.BoxFilter(gray, (3, 3))
-    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
-                                   CustomCV2.THRESH_BINARY_INV, 11, 7)
-    # thresh = CustomCV2.Sobel(blurred, 155)
+    cv2.imshow("Blurred", blurred)
+    # thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
+    #                                CustomCV2.THRESH_BINARY_INV, 11, 7)
+    thresh = CustomCV2.Sobel(blurred, 155)
+    cv2.imshow("Thresh", thresh)
     # thresh = CustomCV2.threshold(blurred, 155, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(frame, contours, -1, (0, 255, 255), 1)
 
     raw_candidates = []
     processed_centers = []
