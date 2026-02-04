@@ -16,30 +16,85 @@ except ImportError as e:
 
 print(CPP_AVAILABLE)
 
+# Terrible!
+class TemporalWarper:
+    def __init__(self, alpha=0.6):
+        self.alpha = alpha
+        self.M_smooth = None
+        self.M_velocity = np.zeros((3, 3), dtype=np.float32)
 
-class TemporalFilter:
-    def __init__(self, persistence=4):
-        self.persistence = persistence
-        self.history = {}
-
-    def process(self, current_tags):
-        verified_tags = []
-        current_ids = [t["id"] for t in current_tags]
-
-        for tag in current_tags:
-            tid = tag["id"]
-            self.history[tid] = min(self.history.get(tid, 0) + 1, self.persistence + 5)
-            
-            if self.history[tid] >= self.persistence:
-                verified_tags.append(tag)
-
-        for tid in list(self.history.keys()):
-            if tid not in current_ids:
-                self.history[tid] -= 1
-                if self.history[tid] <= 0:
-                    del self.history[tid]
+    def process(self, frame, M_curr, d_w, d_h):
+        is_valid = False
+        if M_curr is not None and M_curr.shape == (3, 3):
+            det = np.linalg.det(M_curr)
+            if abs(det) > 1e-5:
+                if abs(M_curr[2, 2]) > 1e-9:
+                    M_curr = M_curr / M_curr[2, 2]
+                is_valid = True
+        if self.M_smooth is None:
+            if is_valid:
+                self.M_smooth = M_curr
+            else:
+                return np.zeros((d_h, d_w), dtype=frame.dtype)
+        else:
+            if is_valid:
+                velocity = M_curr - self.M_smooth
+                self.M_velocity = (1 - self.alpha) * self.M_velocity + self.alpha * velocity
+                self.M_smooth = self.M_smooth + self.M_velocity
+            else:
+                self.M_smooth = self.M_smooth + (self.M_velocity*0.9)
         
-        return verified_tags
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+        final_M = self.M_smooth
+        warped = CustomCV2.warpPerspective(frame, final_M, (d_w, d_h))
+        return warped
+
+class GatedWarper:
+    def __init__(self):
+        self.last_M = None
+        self.max_translation = 1000
+        self.max_rotation = 15.0
+    
+    def sanity_check(self, M):
+        if M is None or M.shape != (3, 3):
+            return False
+        det = np.linalg.det(M)
+        if abs(det) < 1e-5:
+            return False
+        return True
+    
+    def movement_check(self, M, width, height):
+        cx, cy = width / 2.0, height / 2.0
+
+        denom = M[2, 0] * cx + M[2, 1] * cy + M[2, 2]
+        if abs(denom) < 1e-9:
+            return False
+        
+        new_cx = (M[0, 0] * cx + M[0, 1] * cy + M[0, 2]) / denom
+        new_cy = (M[1, 0] * cx + M[1, 1] * cy + M[1, 2]) / denom
+
+        last_denom = self.last_M[2, 0] * cx + self.last_M[2, 1] * cy + self.last_M[2, 2]
+        last_cx = (self.last_M[0, 0] * cx + self.last_M[0, 1] * cy + self.last_M[0, 2]) / last_denom
+        last_cy = (self.last_M[1, 0] * cx + self.last_M[1, 1] * cy + self.last_M[1, 2]) / last_denom
+
+        dist = math.sqrt((new_cx - last_cx)**2 + (new_cy - last_cy)**2)
+        if dist > self.max_translation:
+            return False
+        return True
+    
+    def process(self, frame, M_curr, d_w, d_h):
+        
+        if self.sanity_check(M_curr):
+            self.last_M = M_curr
+            final_M = M_curr
+        elif self.last_M is not None and self.movement_check(M_curr, frame.shape[1], frame.shape[0]):
+            final_M = self.last_M
+        else:
+            final_M = M_curr if self.last_M is None else M_curr + (self.last_M - M_curr)*0.2
+
+        warped = CustomCV2.warpPerspective(frame, final_M, (d_w, d_h))
+        return warped
 
 SIDE = 400
 WARP_DST = np.array([[0, 0], [SIDE-1, 0], [SIDE-1, SIDE-1], [0, SIDE-1]], dtype="float32")
@@ -49,8 +104,6 @@ TAG_BORDER_WIDTH = 1
 CENTER_PROXIMITY_THRESH_SQUARED = 400
 CORE_START_CELL = 2
 CORE_END_CELL = 6
-FRAME_TRACKER = TemporalFilter(persistence=3)
-
 
 class OBJ:
     def __init__(self, filename, swapyz=False):
@@ -223,6 +276,8 @@ def decode_tag(warped_tag: np.ndarray):
 
 
 def process_frame(frame):
+    # warper = TemporalWarper(alpha=0.5)
+    warper = GatedWarper()
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 # 3% of frame
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
@@ -262,18 +317,18 @@ def process_frame(frame):
             pre_order = time()
             rect = order_points(quad)
             post_order = time()
-            print(f"Ordering Time: {(post_order - pre_order)*1000:.3f} ms")
+            # print(f"Ordering Time: {(post_order - pre_order)*1000:.3f} ms")
             # rect = refine_corners(gray, rect)
 
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
             post_H = time()
-            print(f"H Matrix Time: {(post_H - post_order)*1000:.3f} ms")
-            warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
+            # print(f"H Matrix Time: {(post_H - post_order)*1000:.3f} ms")
+            warped = warper.process(gray, H, SIDE, SIDE)
             post_warp = time()
-            print(f"Warp Time: {(post_warp - post_H)*1000:.3f} ms")
+            # print(f"Warp Time: {(post_warp - post_H)*1000:.3f} ms")
             result = decode_tag(warped)
             post_decode = time()
-            print(f"Decode Time: {(post_decode - post_warp)*1000:.3f} ms")
+            # print(f"Decode Time: {(post_decode - post_warp)*1000:.3f} ms")
             
             if result[0] is not None:
                 tag_id, orient_idx = result
@@ -282,7 +337,6 @@ def process_frame(frame):
                 processed_centers.append((cX, cY))
                 raw_candidates.append({"id": tag_id, "corners": rect, "rotation": orient_idx * 90})
 
-    # stable_tags = FRAME_TRACKER.process(raw_candidates)
     stable_tags = raw_candidates
     
     for tag in stable_tags:

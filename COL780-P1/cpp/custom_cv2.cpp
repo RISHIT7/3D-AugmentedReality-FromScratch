@@ -45,17 +45,24 @@ inline double get_dist_sq(int x1, int y1, int x2, int y2) {
     return dx * dx + dy * dy;
 }
 
-void invert_3x3(const double* mat, double* invMat) {
+bool normalize_invert_3x3(const double* mat, double* invMat) {
+    double max = 0.0;
+    for (int i = 0; i < 9; i++) {
+        max = std::max(max, std::abs(mat[i]));
+    }
+    if (max < 1e-9) return false;
+
+    double normMat[9];
+    double scale = 1.0 / max;
+    for (int i = 0; i < 9; i++) {
+        normMat[i] = mat[i] * scale;
+    }
+
     double det = mat[0] * (mat[4] * mat[8] - mat[5] * mat[7]) -
                  mat[1] * (mat[3] * mat[8] - mat[5] * mat[6]) +
                  mat[2] * (mat[3] * mat[7] - mat[4] * mat[6]);
-
     if (std::abs(det) < 1e-9) {
-        std::cerr << "Warning: Singular matrix, cannot invert. Returning identity matrix." << std::endl;
-        for (int i = 0; i < 9; i++) {
-            invMat[i] = (i % 4 == 0) ? 1.0 : 0.0;
-        }
-        return;
+        return false;
     }
 
     double invDet = 1.0 / det;
@@ -68,6 +75,12 @@ void invert_3x3(const double* mat, double* invMat) {
     invMat[6] = (mat[3] * mat[7] - mat[4] * mat[6]) * invDet;
     invMat[7] = (mat[1] * mat[6] - mat[0] * mat[7]) * invDet;
     invMat[8] = (mat[0] * mat[4] - mat[1] * mat[3]) * invDet;
+
+    for (int i = 0; i < 9; i++) {
+        invMat[i] *= scale;
+    }
+
+    return true;
 }
 
 double perpendicular_distance(int x, int y, int x1, int y1, int x2, int y2) {
@@ -118,10 +131,10 @@ py::array_t<uint8_t> warpPerspective_cpp(const py::array_t<uint8_t> src, const p
     auto buf_src = src.request();
     int s_h = buf_src.shape[0];
     int s_w = buf_src.shape[1];
-    auto result = py::array_t<uint8_t>({d_h, d_w});
 
-    uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+    auto result = py::array_t<uint8_t>({d_h, d_w});
     uint8_t* raw_dst = (uint8_t*)result.request().ptr;
+    uint8_t* raw_src = (uint8_t*)buf_src.ptr;
 
     double mat[9], invM[9];
     auto r_M = M.unchecked<2>();
@@ -130,43 +143,59 @@ py::array_t<uint8_t> warpPerspective_cpp(const py::array_t<uint8_t> src, const p
             mat[i * 3 + j] = r_M(i, j);
         }
     }
-    invert_3x3(mat, invM);
 
-    #pragma omp parallel for collapse(2)
+    if (!normalize_invert_3x3(mat, invM)) {
+        std::fill(raw_dst, raw_dst + d_w * d_h, 0);
+        return result;
+    }
+
+    #pragma omp parallel for
     for (int y = 0; y < d_h; y++) {
+
+        double num_x = invM[1] * y + invM[2];
+        double num_y = invM[4] * y + invM[5];
+        double denom = invM[7] * y + invM[8];
+
+        const double row_num_x = invM[0];
+        const double row_num_y = invM[3];
+        const double row_den = invM[6];
+
+        uint8_t* row_ptr = raw_dst + y * d_w;
+
         for (int x = 0; x < d_w; x++) {
-            double denom = invM[6] * x + invM[7] * y + invM[8];
-            
             if (std::abs(denom) < 1e-9) {
-                raw_dst[y * d_w + x] = 0;
+                row_ptr[x] = 0;
                 continue;
             }
 
-            double src_x = (invM[0] * x + invM[1] * y + invM[2]) / denom;
-            double src_y = (invM[3] * x + invM[4] * y + invM[5]) / denom;
+            double w_inv = 1.0 / denom;
+            double src_x = num_x * w_inv;
+            double src_y = num_y * w_inv;
 
-            src_x = std::max(0.0, std::min(src_x, static_cast<double>(s_w - 1)));
-            src_y = std::max(0.0, std::min(src_y, static_cast<double>(s_h - 1)));
+            int x0 = static_cast<int>(src_x);
+            int y0 = static_cast<int>(src_y);
 
-            int x0 = static_cast<int>(std::floor(src_x));
-            int y0 = static_cast<int>(std::floor(src_y));
+            if (x0 >= 0 && x0 < s_w - 1 && y0 >= 0 && y0 < s_h - 1) {
+                float dx = static_cast<float>(src_x - x0);
+                float dy = static_cast<float>(src_y - y0);
 
-            int x1 = std::min(x0 + 1, s_w - 1);
-            int y1 = std::min(y0 + 1, s_h - 1);
+                int offset = y0 * s_w + x0;
+                uint8_t p00 = raw_src[offset];
+                uint8_t p01 = raw_src[offset + 1];
+                uint8_t p10 = raw_src[offset + s_w];
+                uint8_t p11 = raw_src[offset + s_w + 1];
 
-            float dx = static_cast<float>(src_x - x0);
-            float dy = static_cast<float>(src_y - y0);
-
-            x0 = std::max(0, std::min(x0, s_w - 1));
-            x1 = std::max(0, std::min(x1, s_w - 1));
-            y0 = std::max(0, std::min(y0, s_h - 1));
-            y1 = std::max(0, std::min(y1, s_h - 1));
-
-            float val = raw_src[y0 * s_w + x0] * (1.0f - dx) * (1.0f - dy) +
-                        raw_src[y0 * s_w + x1] * dx * (1.0f - dy) +
-                        raw_src[y1 * s_w + x0] * (1.0f - dx) * dy +
-                        raw_src[y1 * s_w + x1] * dx * dy;
-            raw_dst[y * d_w + x] = clip_u8(val);
+                float val = p00 * (1.0f - dx) * (1.0f - dy) +
+                            p01 * dx * (1.0f - dy) +
+                            p10 * (1.0f - dx) * dy +
+                            p11 * dx * dy;
+                row_ptr[x] = clip_u8(val);
+            } else {
+                row_ptr[x] = 0;
+            }
+            num_x += row_num_x;
+            num_y += row_num_y;
+            denom += row_den;
         }
     }
 
