@@ -43,10 +43,10 @@ def main():
         if key == ord('r'):
             paused = False
 
-        if run_twice > 0:
-            run_twice -= 1
-        else:
-            break
+        # if run_twice > 0:
+        #     run_twice -= 1
+        # else:
+        #     break
 
     cap.release()
     cv2.destroyAllWindows()

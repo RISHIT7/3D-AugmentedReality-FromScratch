@@ -278,6 +278,54 @@ py::array_t<int> approxPolyDP_cpp(const py::array_t<int>& curve, double epsilon,
     return result_array;
 }
 
+py::array_t<uint8_t> adaptiveThreshold_cpp(const py::array_t<uint8_t> src, double maxValue, int blockSize, double C) {
+    auto buf_src = src.request();
+    int s_h = buf_src.shape[0];
+    int s_w = buf_src.shape[1];
+    uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+
+    auto result = py::array_t<uint8_t>({s_h, s_w});
+    auto raw_dst = result.mutable_unchecked<2>();
+
+    std::vector<int> integral((s_h + 1) * (s_w + 1), 0);
+    int stride = s_w + 1;
+
+    for (int y = 1; y <= s_h; y++) {
+        int row_sum = 0;
+        for (int x = 1; x <= s_w; x++) {
+            row_sum += raw_src[(y - 1) * s_w + (x - 1)];
+            integral[y * stride + x] = integral[(y - 1) * stride + x] + row_sum;
+        }
+    }
+
+    int half_block = blockSize / 2;
+
+    #pragma omp parallel for collapse(2)
+    for (int y = 0; y < s_h; y++) {
+        for (int x = 0; x < s_w; x++) {
+            int x1 = std::max(0, x - half_block);
+            int y1 = std::max(0, y - half_block);
+            int x2 = std::min(s_w - 1, x + half_block);
+            int y2 = std::min(s_h - 1, y + half_block);
+
+            int count = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+            int sum = integral[(y2 + 1) * stride + (x2 + 1)]
+                      - integral[(y1) * stride + (x2 + 1)]
+                      - integral[(y2 + 1) * stride + (x1)]
+                      + integral[(y1) * stride + (x1)];
+
+            if (static_cast<int>(raw_src[y * s_w + x]) * count < sum - C * count) {
+                raw_dst(y, x) = static_cast<uint8_t>(maxValue);
+            } else {
+                raw_dst(y, x) = 0;
+            }
+        }
+    }
+
+    return result;
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -292,4 +340,8 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("approxPolyDP_cpp", &approxPolyDP_cpp, 
           py::arg("curve"), py::arg("epsilon"), py::arg("closed") = false,
           "Approximates a polygonal curve with the specified precision epsilon using the Douglas-Peucker algorithm.");
+
+    m.def("adaptiveThreshold_cpp", &adaptiveThreshold_cpp, 
+          py::arg("src"), py::arg("maxValue"), py::arg("blockSize"), py::arg("C"),
+          "Applies adaptive thresholding to the input grayscale image.");
 }

@@ -251,7 +251,15 @@ class CustomCV2:
         """
         if blockSize % 2 == 0:
             blockSize += 1  # Block size must be odd
+        
+        if CPP_AVAILABLE:
+            res = custom_cv2_cpp.adaptiveThreshold_cpp(src, maxValue, blockSize, C)
+        
+            if thresholdType == CustomCV2.THRESH_BINARY_INV:
+                res = maxValue - res
             
+            return res
+
         if adaptiveMethod == CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C:
             # OpenCV formula to derive sigma from ksize if not provided
             sigma = 0.3 * ((blockSize - 1) * 0.5 - 1) + 0.8
