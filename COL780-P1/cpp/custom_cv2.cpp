@@ -326,6 +326,142 @@ py::array_t<uint8_t> adaptiveThreshold_cpp(const py::array_t<uint8_t> src, doubl
     return result;
 }
 
+py::array_t<uint8_t> boxFilter_cpp(const py::array_t<uint8_t> src, const int ksize) {
+    auto buf_src = src.request();
+    int s_h = buf_src.shape[0];
+    int s_w = buf_src.shape[1];
+    const uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+
+    std::vector<int> temp(s_h * s_w);
+    auto result = py::array_t<uint8_t>({s_h, s_w});
+    auto raw_dst = result.mutable_unchecked<2>();
+
+    int half_ksize = ksize / 2;
+    float norm = 1.0f / (ksize * ksize);
+
+    #pragma omp parallel for
+    for (int y = 0; y < s_h; y++) {
+        const uint8_t* row_ptr = raw_src + y * s_w;
+        int* temp_row_ptr = temp.data() + y * s_w;
+
+        int sum = 0;
+        for (int i = 0; i < ksize; i++) {
+            sum += row_ptr[std::min(i, s_w - 1)];
+        }
+
+        for (int x = 0; x < s_w; x++) {
+            temp_row_ptr[x] = sum;
+            
+            int idx_remove = x - half_ksize;
+            int idx_add = x + half_ksize + 1;
+
+            int idx_remove_clipped = std::max(0, idx_remove);
+            int idx_add_clipped = std::min(s_w - 1, idx_add);
+
+            sum -= row_ptr[idx_remove_clipped];
+            sum += row_ptr[idx_add_clipped];
+        }
+    }
+
+    #pragma omp parallel for
+    for (int x = 0; x < s_w; x++) {
+        int sum = 0;
+        for (int i = 0; i < ksize; i++) {
+            sum += temp[std::min(i, s_h - 1) * s_w + x];
+        }
+        for (int y = 0; y < s_h; y++) {
+            raw_dst(y, x) = static_cast<uint8_t>(sum * norm);
+
+            int idx_remove = y - half_ksize;
+            int idx_add = y + half_ksize + 1;
+
+            int idx_remove_clipped = std::max(0, idx_remove);
+            int idx_add_clipped = std::min(s_h - 1, idx_add);
+
+            sum -= temp[idx_remove_clipped * s_w + x];
+            sum += temp[idx_add_clipped * s_w + x];
+        }
+    }
+    return result;
+}
+
+py::array_t<uint8_t> gaussianBlur_cpp(const py::array_t<uint8_t> src, const int ksize, const float sigma) {
+    auto buf_src = src.request();
+    int s_h = buf_src.shape[0];
+    int s_w = buf_src.shape[1];
+    const uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+
+    std::vector<float> kernel(ksize);
+    float sum = 0.0f;
+    int half_ksize = ksize / 2;
+    for (int i = 0; i < ksize; i++) {
+        int x = i - half_ksize;
+        kernel[i] = std::exp(-(x * x) / (2 * sigma * sigma));
+        sum += kernel[i];
+    }
+    for (int i = 0; i < ksize; i++) {
+        kernel[i] /= sum;
+    }
+
+    std::vector<float> temp(s_h * s_w);
+    auto result = py::array_t<uint8_t>({s_h, s_w});
+    auto raw_dst = result.mutable_unchecked<2>();
+
+    #pragma omp parallel for
+    for (int y = 0; y < s_h; y++) {
+        const uint8_t* row_ptr = raw_src + y * s_w;
+        float* temp_row_ptr = temp.data() + y * s_w;
+
+        for (int x = 0; x < s_w; x++) {
+            float val = 0.0f;
+            for (int k = -half_ksize; k <= half_ksize; k++) {
+                int idx = std::min(std::max(x + k, 0), s_w - 1);
+                val += row_ptr[idx] * kernel[k + half_ksize];
+            }
+            temp_row_ptr[x] = val;
+        }
+    }
+
+    #pragma omp parallel for
+    for (int x = 0; x < s_w; x++) {
+        for (int y = 0; y < s_h; y++) {
+            float val = 0.0f;
+            for (int k = -half_ksize; k <= half_ksize; k++) {
+                int idx = std::min(std::max(y + k, 0), s_h - 1);
+                val += temp[idx * s_w + x] * kernel[k + half_ksize];
+            }
+            raw_dst(y, x) = clip_u8(val);
+        }
+    }
+    return result;
+}
+
+py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
+    auto buf_src = src.request();
+    if (buf_src.ndim != 3 || buf_src.shape[2] != 3) {
+        throw std::runtime_error("Input image must have 3 channels (H, W, 3)");
+    }
+    int s_h = buf_src.shape[0];
+    int s_w = buf_src.shape[1];
+    const uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+
+    auto result = py::array_t<uint8_t>({s_h, s_w});
+    auto buf_res = result.request();
+    uint8_t* raw_dst = (uint8_t*)buf_res.ptr;
+
+    #pragma omp parallel for collapse(2)
+    for (int y = 0; y < s_h; y++) {
+        const uint8_t* row_ptr = raw_src + y * s_w * 3;
+        uint8_t* dst_row_ptr = raw_dst + y * s_w;
+
+        for (int x = 0; x < s_w; x++) {
+            float gray = 0.299f * row_ptr[x * 3 + 2] + 0.587f * row_ptr[x * 3 + 1] + 0.114f * row_ptr[x * 3 + 0];
+            dst_row_ptr[x] = clip_u8(gray);
+        }
+    }
+    return result;
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -344,4 +480,17 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("adaptiveThreshold_cpp", &adaptiveThreshold_cpp, 
           py::arg("src"), py::arg("maxValue"), py::arg("blockSize"), py::arg("C"),
           "Applies adaptive thresholding to the input grayscale image.");
+    
+    m.def("boxFilter_cpp", &boxFilter_cpp, 
+          py::arg("src"), py::arg("ksize"),
+          "Applies a box filter to the input image with the specified kernel size.");
+          
+    m.def("gaussianBlur_cpp", &gaussianBlur_cpp,
+          py::arg("src"), py::arg("ksize"), py::arg("sigma"),
+          "Applies Gaussian blur to the input image with the specified kernel size and sigma.");
+
+    m.def("cvtColor_cpp", &cvtColor_cpp,
+          py::arg("src"),
+          "Converts a BGR image to grayscale.");
+
 }

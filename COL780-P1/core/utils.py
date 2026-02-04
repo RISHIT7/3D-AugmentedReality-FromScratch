@@ -210,30 +210,15 @@ def decode_tag(warped_tag: np.ndarray):
 
 def process_frame(frame):
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 # 3% of frame
-
-
-    pre_gray = time()
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
-    post_gray = time()
-    print(f"Grayscale Conversion Time: {post_gray - pre_gray:.4f} seconds")
 
 
     # blurred = CustomCV2.GaussianBlur(gray, (3, 3), 50)
     blurred = CustomCV2.BoxFilter(gray, (3, 3))
-    post_blur = time()
-    print(f"Gaussian Blur Time: {post_blur - post_gray:.4f} seconds")
-    
     thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
                                    CustomCV2.THRESH_BINARY_INV, 11, 7)
-
     # thresh = CustomCV2.Sobel(blurred, 155)
-
     # thresh = CustomCV2.threshold(blurred, 155, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
-
-    post_thresh = time()
-    cv2.imshow("Thresholded", thresh)
-    print(f"Adaptive Thresholding Time: {post_thresh - post_blur:.4f} seconds")
-
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
 
     raw_candidates = []
@@ -242,27 +227,10 @@ def process_frame(frame):
     for cnt in contours:
         if CustomCV2.contourArea(cnt) < MIN_TAG_AREA:
             continue
-        
-        pre_peri = time()
         peri = CustomCV2.arcLength(cnt, True)
-        post_peri = time()
-        print(f"Contour Perimeter Time: {post_peri - pre_peri:.4f} seconds")
         # quad = cv2.approxPolyDP(cnt, 0.02 * peri, True)
         quad = CustomCV2.approxPolyDP(cnt, 0.02 * peri, True)
-        post_approx = time()
-        print(f"Contour Approximation Time: {post_approx - post_peri:.4f} seconds")
-        # print("-------")
-        # print(quad_cv2)
-        # print("=======")
-        # print(quad)
-        # print("-------")
-        # print(quad.shape, type(quad))
-        # print(quad_cv2.shape, type(quad_cv2))
-        # print(len(quad), len(quad_cv2))
-        # print(cv2.isContourConvex(quad_cv2), cv2.isContourConvex(quad))
-        # print("-------")
         # cv2.drawContours(frame, [quad], -1, (255, 0, 0), 2)
-
         # quad = CustomCV2.findCornersQuadrilateral(cnt)
         
         if len(quad) == 4 and CustomCV2.isContourConvex(quad):
@@ -279,12 +247,8 @@ def process_frame(frame):
 
             rect = order_points(quad)
             # rect = refine_corners(gray, rect)
-            pre_perspective = time()
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
-            post_perspective = time()
-            print(f"Perspective Transform Time: {post_perspective - pre_perspective:.4f} seconds")
             warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
-
             result = decode_tag(warped)
             
             if result[0] is not None:

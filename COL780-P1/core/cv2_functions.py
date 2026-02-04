@@ -48,6 +48,8 @@ class CustomCV2:
 
     @staticmethod
     def cvtColor(src: np.ndarray, code: int) -> np.ndarray:
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.cvtColor_cpp(src)
         if code == CustomCV2.COLOR_BGR2GRAY:
             if src.ndim == 2:
                 return src.copy()
@@ -64,6 +66,8 @@ class CustomCV2:
         """
         Highly optimized Box Filter using moving sums (O(1) per pixel relative to kernel size).
         """
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.boxFilter_cpp(src, ksize[0])
         kx, ky = ksize
         # Ensure source is float for precision during accumulation
         res = src.astype(np.float32)
@@ -98,6 +102,9 @@ class CustomCV2:
 
     @staticmethod
     def GaussianBlur(src: np.ndarray, ksize: Tuple[int, int], sigmaX: float) -> np.ndarray:
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.gaussianBlur_cpp(src, ksize[0], sigmaX)
+
         kx, ky = ksize
         kernel_x = CustomCV2._make_gaussian_kernel(kx, sigmaX)
         kernel_y = CustomCV2._make_gaussian_kernel(ky, sigmaX)
