@@ -1,6 +1,6 @@
-import cv2 # OpenCV - Only for video capture and display
+import cv2
 import argparse
-from core.utils import * # Define custom CV functions in utils.py
+from core.utils import *
 
 from core.evaluate import Evaluator
 

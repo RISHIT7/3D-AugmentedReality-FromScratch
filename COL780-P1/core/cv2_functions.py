@@ -13,9 +13,7 @@ try:
 except ImportError as e:
     CPP_AVAILABLE = False
 
-# GRAY_WEIGHTS = np.array([0.114, 0.587, 0.299], dtype=np.float32)
 GRAY_WEIGHTS = np.array([0.3333, 0.3333, 0.3333], dtype=np.float32) # max entropy
-# GRAY_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 MIN_CONTOUR_POINTS = 10
 print(CPP_AVAILABLE)
 
@@ -37,7 +35,6 @@ class CustomCV2:
     INTER_NEAREST = 0
     INTER_LINEAR = 1
     
-    # ---- self implemented temporal OTSU --------
     THRESH_OTSU = 8
     THRESH_TEMPORAL_APPROX_OTSU = 16
     _EMA_THRESH = 155
@@ -396,8 +393,8 @@ class CustomCV2:
         if len(pts) < 3:
             return 0.0
         
-        x = pts[:, 0]
-        y = pts[:, 1]
+        x = pts[:, 0].astype(np.float64)
+        y = pts[:, 1].astype(np.float64)
         x_next = np.roll(x, -1)
         y_next = np.roll(y, -1)
 

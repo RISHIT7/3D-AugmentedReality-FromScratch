@@ -13,28 +13,15 @@
 
 -----
 Todo
-- decode_tag
 - temporal filters
 - corner refinements
-- Boxfilter vs gaussian blur
+- Boxfilter vs gaussian blur vs bilateeralFilter
 - blocksize of adaptive threshold
-- SIMD
 - > Optimize adaptiveThreshold Further ★★★★☆
 > Current: C++ with integral image
 > Proposal: SIMD vectorization for integral image computation
 > cpp#include <immintrin.h>  // AVX2
 > // Process 8 pixels at once with _mm256_add_epi32
--  > Early Rejection in Contour Processing ★★★★☆
-> python# BEFORE contour approximation
-> if CustomCV2.contourArea(cnt) < MIN_TAG_AREA or \
->    CustomCV2.contourArea(cnt) > MAX_TAG_AREA:
->     continue
-> 
-> # Add aspect ratio check
-> bbox = cv2.boundingRect(cnt)
-> aspect = max(w,h) / min(w,h)
-> if aspect > 1.5:  # Tags are square
->     continue
 -  > Memory Pooling for Intermediate Buffers ★★★☆☆
 > cpp// Reuse warped tag buffers instead of allocating per tag
 > thread_local std::vector<uint8_t> warp_buffer(SIDE * SIDE);

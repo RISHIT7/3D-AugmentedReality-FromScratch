@@ -15,6 +15,42 @@ try:
 except ImportError as e:
     CPP_AVAILABLE = False
 
+print(CPP_AVAILABLE)
+
+# Terrible!
+class TemporalWarper:
+    def __init__(self, alpha=0.6):
+        self.alpha = alpha
+        self.M_smooth = None
+        self.M_velocity = np.zeros((3, 3), dtype=np.float32)
+
+    def process(self, frame, M_curr, d_w, d_h):
+        is_valid = False
+        if M_curr is not None and M_curr.shape == (3, 3):
+            det = np.linalg.det(M_curr)
+            if abs(det) > 1e-5:
+                if abs(M_curr[2, 2]) > 1e-9:
+                    M_curr = M_curr / M_curr[2, 2]
+                is_valid = True
+        if self.M_smooth is None:
+            if is_valid:
+                self.M_smooth = M_curr
+            else:
+                return np.zeros((d_h, d_w), dtype=frame.dtype)
+        else:
+            if is_valid:
+                velocity = M_curr - self.M_smooth
+                self.M_velocity = (1 - self.alpha) * self.M_velocity + self.alpha * velocity
+                self.M_smooth = self.M_smooth + self.M_velocity
+            else:
+                self.M_smooth = self.M_smooth + (self.M_velocity*0.9)
+        
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+        final_M = self.M_smooth
+        warped = CustomCV2.warpPerspective(frame, final_M, (d_w, d_h))
+        return warped
+
 class GatedWarper:
     def __init__(self):
         self.last_M = None
@@ -243,25 +279,117 @@ def decode_tag(warped_tag: np.ndarray):
 
 
 def process_frame(frame):
-    MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 
-    MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9    
-
+    # warper = TemporalWarper(alpha=0.5)
     warper = GatedWarper()
+    MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 # 0.03% of frame
+    MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9    # 90% of frame
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
+    # blurred = CustomCV2.GaussianBlur(gray, (5, 5), 30)
     blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 7) 
+    # blurred = CustomCV2.BoxFilter(gray, (1, 1))
+    # blurred = gray
+    # cv2.imshow("Blurred", blurred)
+    
+    # thresh = cv2.threshold(blurred, 155, 255, CustomCV2.THRESH_BINARY_INV)[1] Pretty good tbh
+    # thresh = cv2.threshold(blurred, 155, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] Not better than fixed
+    # thresh = cv2.threshold(blurred, 155, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE)[1] NAH
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                   cv2.THRESH_BINARY_INV, 11, 7) # Prone to noise
+    # thresh = cv2.Canny(blurred, 100, 200) # Edges are bad
+    # thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, 
+    #                                CustomCV2.THRESH_BINARY_INV, 11, 7)
+    # thresh = CustomCV2.Sobel(blurred, 155)
+    # sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    # sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    # grad_mag = np.sqrt(sobelx**2 + sobely**2)
+    # grad_mad = np.uint8(np.clip((grad_mag / np.max(grad_mag)) * 255, 0, 255))
+    # thresh = cv2.threshold(grad_mad, 100, 255, cv2.THRESH_BINARY)[1] Decent but noisy
+
+    # laplacian = cv2.Laplacian(blurred, cv2.CV_64F)
+    # laplacian_mag = np.uint8(np.clip(np.abs(laplacian), 0, 255))
+    # thresh = cv2.threshold(laplacian_mag, 0, 255, cv2.THRESH_BINARY)[1] #very noisy
+
+    # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # gradient = cv2.morphologyEx(blurred, cv2.MORPH_GRADIENT, kernel)
+    # thresh = cv2.threshold(gradient, 15, 255, cv2.THRESH_BINARY)[1] # okayish
+    # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    # tophat = cv2.morphologyEx(blurred, cv2.MORPH_TOPHAT, kernel)
+    # thresh = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY)[1] # absolut garbage
+
+    # ------ multiscale retinex ------
+    # scales = [15, 80, 250]
+    # retinex = np.zeros_like(blurred, dtype=np.float32)
+    # for scale in scales:
+    #     blur = cv2.GaussianBlur(blurred, (3, 3), scale)
+    #     retinex += np.log1p(gray.astype(np.float32)) - np.log1p(blur.astype(np.float32))
+
+    # retinex = (retinex / len(scales))
+    # retinex = np.uint8(np.clip((retinex - np.min(retinex)) / (np.max(retinex) - np.min(retinex)) * 255, 0, 255))
+    # _, thresh = cv2.threshold(retinex, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # -------------------------------    
+
+    # blur1 = cv2.GaussianBlur(gray, (3, 3), 15)
+    # blur2 = cv2.GaussianBlur(gray, (3, 3), 80)
+    # dog = cv2.subtract(blur1, blur2)
+    # _, thresh = cv2.threshold(dog, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # ------ combined methods ------
+    # adaptive_mean = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+    #                                    cv2.THRESH_BINARY, 11, 2)
+    # blur = cv2.GaussianBlur(gray, (5, 5), 5)
+    # edges = cv2.Canny(blur, 50, 150)
+    # combined = cv2.bitwise_or(adaptive_mean, edges)
+    # _, thresh = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ------------------------------
+
+    # ------ GRadient adaptive ------
+    # grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    # grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    # grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+    # grad_mad = np.uint8(np.clip((grad_mag / np.max(grad_mag)) * 255, 0, 255))
+    # thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+    #                                cv2.THRESH_BINARY, 11, 7)
+    # combined = cv2.bitwise_or(thresh, grad_mad)
+    # _, thresh = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ------------------------------
+
+    # ------ bradly roth ------
+    # block_size = gray.shape[0] // 8
+    # block_size = block_size + 1 if block_size % 2 == 0 else block_size
+    # thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+    #                                CustomCV2.THRESH_BINARY, block_size, 15)
+    # ------------------------------
+
+    # all the new ones are terrible, back to simple fixed thresholding
+    # thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+    #                                cv2.THRESH_BINARY, 11, 7)
+    # sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
+    # sobely = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
+    # grad_mag = np.sqrt(sobelx**2 + sobely**2)
+    # grad_mad = np.uint8(np.clip((grad_mag / np.max(grad_mag)) * 255, 0, 255))
+    # combined = cv2.bitwise_or(grad_mad, blurred)
+    # _, thresh = cv2.threshold(combined, 155, 255, cv2.THRESH_BINARY)
+    # ------------------------------
+
+    cv2.imshow("Thresh", thresh)
+    # thresh = CustomCV2.threshold(blurred, 155, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(frame, contours, -1, (255, 0, 255), 2)
 
     raw_candidates = []
     processed_centers = []
 
     for cnt in contours:
         area = CustomCV2.contourArea(cnt)
+        # print(area, MIN_TAG_AREA)
         if area < MIN_TAG_AREA or area > MAX_TAG_AREA:
             continue
         peri = CustomCV2.arcLength(cnt, True)
+        # quad = cv2.approxPolyDP(cnt, 0.02 * peri, True)
         quad = CustomCV2.approxPolyDP(cnt, 0.02 * peri, True)
+        # cv2.drawContours(frame, [quad], -1, (255, 0, 0), 2)
+        # quad = CustomCV2.findCornersQuadrilateral(cnt)
         
         if len(quad) == 4 and CustomCV2.isContourConvex(quad):
             M = CustomCV2.moments(quad)
@@ -275,10 +403,21 @@ def process_frame(frame):
                 if np.any(dists < CENTER_PROXIMITY_THRESH_SQUARED):
                     continue
             
+            pre_order = time()
             rect = order_points(quad)
+            post_order = time()
+            # print(f"Ordering Time: {(post_order - pre_order)*1000:.3f} ms")
+            # rect = refine_corners(gray, rect)
+
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
+            post_H = time()
+            # print(f"H Matrix Time: {(post_H - post_order)*1000:.3f} ms")
             warped = warper.process(gray, H, SIDE, SIDE)
+            post_warp = time()
+            # print(f"Warp Time: {(post_warp - post_H)*1000:.3f} ms")
             result = decode_tag(warped)
+            post_decode = time()
+            # print(f"Decode Time: {(post_decode - post_warp)*1000:.3f} ms")
             
             if result[0] is not None:
                 tag_id, orient_idx = result
