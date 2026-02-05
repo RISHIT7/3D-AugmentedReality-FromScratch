@@ -144,16 +144,19 @@ def render(img, obj, projection, model, color=False):
 
 def order_points(pts):
     pts = pts.reshape(4, 2)
-    center = pts.mean(axis=0)
 
-    angles = np.arctan2(pts[:,1] - center[1], pts[:,0] - center[0])
-    sorted_idx = np.argsort(angles)
-    sorted_pts = pts[sorted_idx]
-    
-    top_left_idx = np.argmin(np.sum(sorted_pts, axis=1))
-    rect = np.roll(sorted_pts[::-1], top_left_idx-3, axis=0)
-    
-    return rect
+    x_sorted = pts[np.argsort(pts[:, 0])]
+
+    left = x_sorted[:2]
+    right = x_sorted[2:]
+
+    left = left[np.argsort(left[:, 1])]
+    (tl, bl) = left
+
+    right = right[np.argsort(right[:, 1])]
+    (tr, br) = right
+
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 
 def refine_corners(gray, corners):
