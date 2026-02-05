@@ -172,10 +172,14 @@ def decode_tag(warped_tag: np.ndarray, MIN_TAG_AREA: float, MAX_TAG_AREA: float,
         (tag_id, orientation) or (None, None) if invalid
     """
     if CPP_AVAILABLE:
+        cv2.imshow("CPP Warped", warped_tag)
         res_tag_id, res_orientation = custom_cv2_cpp.decode_tag_cpp(warped_tag)
         if (res_tag_id is None or res_orientation is None) and depth < 1:
-            thresh = CustomCV2.threshold(warped_tag, 127, 255, CustomCV2.THRESH_BINARY)[1]
-            cv2.imshow("Debug Thresh", thresh)
+            kernel = np.array([[0, -1, 0],
+                               [-1, 5, -1],
+                               [0, -1, 0]], dtype=np.float32)
+            sharpened = cv2.filter2D(warped_tag, -1, kernel)
+            thresh = CustomCV2.threshold(sharpened, 127, 255, CustomCV2.THRESH_BINARY)[1]
             process_contours(warped_tag, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_secondary, depth=1)
 
     # Threshold the image
