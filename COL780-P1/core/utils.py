@@ -69,6 +69,8 @@ TAG_BORDER_WIDTH = 1
 CENTER_PROXIMITY_THRESH_SQUARED = 400
 CORE_START_CELL = 2
 CORE_END_CELL = 6
+warper_main = GatedWarper()
+warper_secondary = GatedWarper()
 
 class OBJ:
     def __init__(self, filename, swapyz=False):
@@ -159,7 +161,7 @@ def refine_corners(gray, corners):
     return cv2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
 
 
-def decode_tag(warped_tag: np.ndarray):
+def decode_tag(warped_tag: np.ndarray, MIN_TAG_AREA: float, MAX_TAG_AREA: float, depth=0):
     """
     Decode AR tag from warped image.
     
@@ -170,8 +172,12 @@ def decode_tag(warped_tag: np.ndarray):
         (tag_id, orientation) or (None, None) if invalid
     """
     if CPP_AVAILABLE:
-        return custom_cv2_cpp.decode_tag_cpp(warped_tag)
-    cv2.imshow("Warped Tag", warped_tag)
+        res_tag_id, res_orientation = custom_cv2_cpp.decode_tag_cpp(warped_tag)
+        if (res_tag_id is None or res_orientation is None) and depth < 1:
+            thresh = CustomCV2.threshold(warped_tag, 127, 255, CustomCV2.THRESH_BINARY)[1]
+            cv2.imshow("Debug Thresh", thresh)
+            process_contours(warped_tag, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_secondary, depth=1)
+
     # Threshold the image
     _, thresh = CustomCV2.threshold(warped_tag, 155, 255, CustomCV2.THRESH_BINARY)
     side = thresh.shape[0]
@@ -246,11 +252,23 @@ def process_frame(frame):
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 
     MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9    
 
-    warper = GatedWarper()
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
     blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 7) 
+    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, 11, 7) 
+    stable_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_main, depth=0)
+
+    for tag in stable_tags:
+        rect = tag["corners"]
+        cv2.polylines(frame, [np.int32(rect)], True, (0, 255, 0), 2)
+        cv2.putText(frame, f"ID: {tag['id']}", tuple(np.int32(rect[0])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"Rot: {tag['rotation']} deg", tuple(np.int32(rect[1])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+    return frame, stable_tags
+
+def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper, depth=0):
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
 
     raw_candidates = []
@@ -278,8 +296,11 @@ def process_frame(frame):
             rect = order_points(quad)
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
             warped = warper.process(gray, H, SIDE, SIDE)
-            result = decode_tag(warped)
-            
+            if depth == 1:
+                cv2.imshow("Debug Warped", warped)
+            result = decode_tag(warped, MIN_TAG_AREA, MAX_TAG_AREA, depth)
+            if depth == 1:
+                print(f"Debug Decoded Tag: {result}")
             if result[0] is not None:
                 tag_id, orient_idx = result
                 rect = np.roll(rect, -orient_idx, axis=0)
@@ -288,12 +309,4 @@ def process_frame(frame):
 
     stable_tags = raw_candidates
     
-    for tag in stable_tags:
-        rect = tag["corners"]
-        cv2.polylines(frame, [np.int32(rect)], True, (0, 255, 0), 2)
-        cv2.putText(frame, f"ID: {tag['id']}", tuple(np.int32(rect[0])), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(frame, f"Rot: {tag['rotation']} deg", tuple(np.int32(rect[1])), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-    return frame, stable_tags
+    return stable_tags
