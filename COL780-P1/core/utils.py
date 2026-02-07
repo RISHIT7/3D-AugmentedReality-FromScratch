@@ -291,7 +291,7 @@ def process_frame(frame):
 
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
-    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
+    blurred = CustomCV2.bilateralFilter(gray, 9, 75, 75)
     thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, 11, 7) 
     stable_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_main, depth=0)
 

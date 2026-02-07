@@ -1,48 +1,110 @@
 import numpy as np
-from typing import Tuple, List, Optional, Any
-import math
+from typing import Tuple, List, Optional
 
 import sys
 import os
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
     import custom_cv2_cpp # type: ignore
     CPP_AVAILABLE = True
 except ImportError as e:
     CPP_AVAILABLE = False
 
-GRAY_WEIGHTS = np.array([0.3333, 0.3333, 0.3333], dtype=np.float32) # max entropy
-MIN_CONTOUR_POINTS = 10
-print(CPP_AVAILABLE)
-
 class CustomCV2:
+    COLOR_BGR2GRAY = 6
+    GRAY_WEIGHTS = np.array([0.3333, 0.3333, 0.3333], dtype=np.float32)
+    MIN_CONTOUR_POINTS = 10
+    ADAPTIVE_THRESH_GAUSSIAN_C = 1
+    ADAPTIVE_THRESH_MEAN_C = 0
+    INTER_LINEAR = 1
+    NORM_MINMAX = 32
     THRESH_BINARY = 0
     THRESH_BINARY_INV = 1
     THRESH_OTSU = 8
-    ADAPTIVE_THRESH_GAUSSIAN_C = 1
-    ADAPTIVE_THRESH_MEAN_C = 0
-    RETR_TREE = 3
-    RETR_EXTERNAL = 0
-    CHAIN_APPROX_SIMPLE = 2
-    CHAIN_APPROX_NONE = 1
-    TERM_CRITERIA_EPS = 2
-    TERM_CRITERIA_MAX_ITER = 1
-    COLOR_BGR2GRAY = 6
-    FONT_HERSHEY_SIMPLEX = 0
-    NORM_MINMAX = 32
-    INTER_NEAREST = 0
-    INTER_LINEAR = 1
-    
-    THRESH_OTSU = 8
     THRESH_TEMPORAL_APPROX_OTSU = 16
-    _EMA_THRESH = 155
-    _MOMENTUM = 0.0
-    _BETA1 = 0.9
-    _ALPHA = 0.2
-    _FRAME_COUNT = 0
-    _UPDATE_FREQ = 10
+    RETR_TREE = 3
+    CHAIN_APPROX_SIMPLE = 2
+
+    @staticmethod
+    def _make_gaussian_kernel(ksize: int, sigmaX: float) -> np.ndarray:
+        ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
+        kernel = np.exp(-0.5 * (ax / sigmaX) **2)
+        return kernel / kernel.sum()
+
+    @staticmethod
+    def _convolve1d(src: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
+        return np.apply_along_axis(
+            lambda m: np.convolve(m, kernel, mode='same'), axis, src
+        )
+
+    @staticmethod
+    def _compute_otsu_threshold(src: np.ndarray) -> float:
+        if src.size < CustomCV2._threshold_config.min_pixels:
+            return float(np.median(src))
+        
+        hist, _ = np.histogram(src.ravel(), bins=256, range=(0, 256))
+        hist = hist.astype(np.float64)
+
+        bin_centers = np.arange(256)
+        weight_bg = np.cumsum(hist)
+        weight_fg = src.size - weight_bg
+
+        sum_bg = np.cumsum(hist * bin_centers)
+        sum_total = sum_bg[-1]
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mean_bg = sum_bg / weight_bg
+            mean_fg = (sum_total - sum_bg) / weight_fg
+
+            var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+
+        var_between[~np.isfinite(var_between)] = 0
+        return float(np.argmax(var_between))
+    
+    @staticmethod
+    def _compute_temporal_threshold(src: np.ndarray) -> float:
+        thresh, count = CustomCV2._threshold_state.get_and_increment()
+        if count % CustomCV2._threshold_config.update_freq == 0:
+            new_thresh = CustomCV2._compute_otsu_threshold(src)
+            CustomCV2._threshold_state.update(new_thresh)
+            return new_thresh
+        else:
+            return thresh
+        
+    @staticmethod
+    def _apply_threshold(src: np.ndarray, thresh: float, maxval: float, type: int) -> np.ndarray:
+        if type == CustomCV2.THRESH_BINARY:
+            return np.where(src > thresh, maxval, 0).astype(np.uint8)
+        elif type == CustomCV2.THRESH_BINARY_INV:
+            return np.where(src > thresh, 0, maxval).astype(np.uint8)
+        else:
+            return src.copy()
+
+    @staticmethod
+    def _bilinear_sample(src: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        h, w = src.shape[:2]
+
+        src_x = np.clip(x, 0, w - 1)
+        src_y = np.clip(y, 0, h - 1)
+
+        x0 = np.floor(src_x).astype(int)
+        y0 = np.floor(src_y).astype(int)
+        x1 = np.clip(x0 + 1, 0, w - 1)
+        y1 = np.clip(y0 + 1, 0, h - 1)
+
+        dx = src_x - x0
+        dy = src_y - y0
+
+        wa = (1 - dx) * (1 - dy)
+        wb = (1 - dx) * dy
+        wc = dx * (1 - dy)
+        wd = dx * dy
+
+        if src.ndim == 2:
+            return (src[y0, x0] * wa + src[y0, x1] * wb + src[y1, x0] * wc + src[y1, x1] * wd).astype(src.dtype)
+        else:
+            wa, wb, wc, wd = [w[..., None] for w in (wa, wb, wc, wd)]
+            return (src[y0, x0] * wa + src[y1, x0] * wb + src[y0, x1] * wc + src[y1, x1] * wd).astype(src.dtype)
 
     @staticmethod
     def cvtColor(src: np.ndarray, code: int) -> np.ndarray:
@@ -52,7 +114,7 @@ class CustomCV2:
             if src.ndim == 2:
                 return src.copy()
             elif src.ndim == 3 and src.shape[2] == 3:
-                gray = np.dot(src[..., :3], GRAY_WEIGHTS)
+                gray = np.dot(src[..., :3], CustomCV2.GRAY_WEIGHTS)
                 return gray.astype(np.uint8)
             else:
                 raise ValueError("Input image must have 2 or 3 channels for BGR2GRAY conversion")
@@ -85,18 +147,6 @@ class CustomCV2:
         pad_h = ky // 2
         pad_w = kx // 2
         return np.pad(res, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge').astype(src.dtype)
-
-    @staticmethod
-    def _make_gaussian_kernel(ksize: int, sigmaX: float) -> np.ndarray:
-        ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
-        kernel = np.exp(-0.5 * (ax / sigmaX) **2)
-        return kernel / kernel.sum()
-
-    @staticmethod
-    def _convolve1d(src: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-        return np.apply_along_axis(
-            lambda m: np.convolve(m, kernel, mode='same'), axis, src
-        )
 
     @staticmethod
     def GaussianBlur(src: np.ndarray, ksize: Tuple[int, int], sigmaX: float) -> np.ndarray:
@@ -179,72 +229,18 @@ class CustomCV2:
 
     @staticmethod
     def threshold(src: np.ndarray, thresh: float, maxval: float, type: int) -> Tuple[float, np.ndarray]:
-        if type & CustomCV2.THRESH_OTSU:
-            hist, _ = np.histogram(src, bins=256, range=(0, 256))
-            hist = hist.astype(np.float64)
-            
-            bin_centers = np.arange(256)
-            
-            w_bg = np.cumsum(hist)           
-            sum_bg = np.cumsum(hist * bin_centers) 
-            
-            total_pixels = src.size
-            total_sum = sum_bg[-1]
-            
-            w_fg = total_pixels - w_bg
-            sum_fg = total_sum - sum_bg
-            
-            with np.errstate(divide='ignore', invalid='ignore'):
-                mean_bg = sum_bg / w_bg
-                mean_fg = sum_fg / w_fg
-                
-                inter_class_variance = w_bg * w_fg * (mean_bg - mean_fg) ** 2
-            
-            inter_class_variance[np.isnan(inter_class_variance)] = 0
-            thresh = float(np.argmax(inter_class_variance))
-            
-            type &= ~CustomCV2.THRESH_OTSU
-
-        if type == CustomCV2.THRESH_TEMPORAL_APPROX_OTSU:
-            if CustomCV2._FRAME_COUNT % CustomCV2._UPDATE_FREQ == 0:
-                hist, _ = np.histogram(src, bins=256, range=(0, 256))
-                hist = hist.astype(np.float64)
-                bin_centers = np.arange(256)
-                
-                w_bg = np.cumsum(hist)
-                total_px = src.size
-                w_fg = total_px - w_bg
-                
-                sum_bg = np.cumsum(hist * bin_centers)
-                total_sum = sum_bg[-1]
-                
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    variance = w_bg * w_fg * (sum_bg/w_bg - (total_sum - sum_bg)/w_fg) ** 2
-                    variance[np.isnan(variance)] = 0
-                    ideal_thresh = float(np.argmax(variance))                
-
-                # diff = float(ideal_thresh) - CustomCV2._EMA_THRESH
-                # CustomCV2._MOMENTUM = (CustomCV2._BETA1 * CustomCV2._MOMENTUM + 
-                #                     (1 - CustomCV2._BETA1) * diff)
-                # CustomCV2._EMA_THRESH += CustomCV2._ALPHA * CustomCV2._MOMENTUM
-                # CustomCV2._EMA_THRESH = (CustomCV2._BETA1 * CustomCV2._EMA_THRESH +
-                #                         (1 - CustomCV2._BETA1) * ideal_thresh)
-                CustomCV2._EMA_THRESH = ideal_thresh
-                # print(f"Updated EMA Threshold to: {CustomCV2._EMA_THRESH:.2f}")
-            
-            thresh = CustomCV2._EMA_THRESH
-            CustomCV2._FRAME_COUNT += 1
-            
-            type &= ~CustomCV2.THRESH_TEMPORAL_APPROX_OTSU
-
-        if type == CustomCV2.THRESH_BINARY:
-            result = np.where(src > thresh, maxval, 0)
-        elif type == CustomCV2.THRESH_BINARY_INV:
-            result = np.where(src > thresh, 0, maxval)
-        else:
-            result = src.copy()
-            
-        return thresh, result.astype(np.uint8)
+        if src.size == 0:
+            return thresh, np.zeros_like(src, dtype=np.uint8)
+        
+        use_otsu = bool(type & CustomCV2.THRESH_OTSU)
+        use_temporal = bool(type & CustomCV2.THRESH_TEMPORAL_APPROX_OTSU)
+        base_type = type & ~(CustomCV2.THRESH_OTSU | CustomCV2.THRESH_TEMPORAL_APPROX_OTSU)
+        if use_otsu:
+            thresh = CustomCV2._compute_otsu_threshold(src)
+        elif use_temporal:
+            thresh = CustomCV2._compute_temporal_threshold(src)
+        
+        return thresh, CustomCV2._apply_threshold(src, thresh, maxval, base_type)
 
     @staticmethod
     def adaptiveThreshold(src: np.ndarray, maxValue: float, adaptiveMethod: int,
@@ -313,7 +309,7 @@ class CustomCV2:
         binary = np.pad(binary, 1, mode='constant', constant_values=0)
 
         if CPP_AVAILABLE:
-            return custom_cv2_cpp.findContours_cpp(binary, MIN_CONTOUR_POINTS), None
+            return custom_cv2_cpp.findContours_cpp(binary, CustomCV2.MIN_CONTOUR_POINTS), None
 
         h, w = binary.shape
         
@@ -516,14 +512,9 @@ class CustomCV2:
         else:
             pts = contour.astype(np.float64)
         
-        n = len(pts)
+        mo = {k: 0.0 for k in ['m00', 'm10', 'm01', 'm20', 'm11', 'm02']}
         
-        # Initialize dictionary with zeros
-        mo = {k: 0.0 for k in ['m00', 'm10', 'm01', 'm20', 'm11', 'm02', 'm30', 'm21', 'm12', 'm03',
-                               'mu20', 'mu11', 'mu02', 'mu30', 'mu21', 'mu12', 'mu03',
-                               'nu20', 'nu11', 'nu02', 'nu30', 'nu21', 'nu12', 'nu03']}
-        
-        if n < 3:
+        if len(pts) < 3:
             return mo
         
         x = pts[:, 0]
@@ -531,26 +522,15 @@ class CustomCV2:
         x_next = np.roll(x, -1)
         y_next = np.roll(y, -1)
         
-        # Standard Shoelace component
-        a = x * y_next - x_next * y
-        signed_area = 0.5 * np.sum(a)
+        cross = x * y_next - x_next * y
+        signed_area = 0.5 * np.sum(cross)
         
-        if abs(signed_area) < 1e-9:
-            return mo
-
-        # Calculate spatial moments
-        # We take the absolute of the final sum for m00 to match OpenCV's non-oriented behavior
         mo["m00"] = abs(signed_area)
         
-        # m10 and m01 must be adjusted by the sign of the area to remain consistent
-        # regardless of clockwise or counter-clockwise point ordering.
-        area_sign = 1.0 if signed_area > 0 else -1.0
-        
-        mo["m10"] = (1/6) * np.sum((x + x_next) * a) * area_sign
-        mo["m01"] = (1/6) * np.sum((y + y_next) * a) * area_sign
-        
-        # Note: If you need m20, m02, etc., they also require the area_sign adjustment.
-        
+        if abs(signed_area) > 1e-10:
+            sign_correction = np.sign(signed_area)
+            mo["m10"] = (1/6) * np.sum((x + x_next) * cross) * sign_correction
+            mo["m01"] = (1/6) * np.sum((y + y_next) * cross) * sign_correction
         return mo
     
     @staticmethod
@@ -594,100 +574,44 @@ class CustomCV2:
     
     @staticmethod
     def warpPerspective(src: np.ndarray, M: np.ndarray, dsize: Tuple[int, int],
-                       flags: int = INTER_LINEAR) -> np.ndarray:
-        """
-        Applies perspective transformation using Backward Mapping (Inverse warping).
-        Vectorized for performance (avoids slow Python loops).
-        """
+                       tile_height: int = 64) -> np.ndarray:
         width, height = dsize
         if CPP_AVAILABLE:
             return custom_cv2_cpp.warpPerspective_cpp(src, M, width, height)
 
-        # 1. Invert the matrix because we need to map Destination(x,y) -> Source(u,v)
-        # to interpolate pixel values.
         try:
             M_inv = np.linalg.inv(M)
         except np.linalg.LinAlgError:
             return np.zeros((height, width), dtype=src.dtype)
-
-        # 2. Create a grid of coordinates for the Destination image
-        # x_coords: [[0, 1, 2...], [0, 1, 2...]]
-        # y_coords: [[0, 0, 0...], [1, 1, 1...]]
-        x_idxs, y_idxs = np.meshgrid(np.arange(width), np.arange(height))
         
-        # 3. Apply Perspective Equation to the grid: 
-        # src_x = (m00*x + m01*y + m02) / (m20*x + m21*y + m22)
-        # src_y = (m10*x + m11*y + m12) / (m20*x + m21*y + m22)
-        
-        # Pre-extract matrix values for speed
         h00, h01, h02 = M_inv[0]
         h10, h11, h12 = M_inv[1]
         h20, h21, h22 = M_inv[2]
 
-        # Calculate denominator (w')
-        denom = h20 * x_idxs + h21 * y_idxs + h22
-        # Avoid division by zero
-        denom[denom == 0] = 1e-9
-        
-        # Calculate source coordinates
-        src_x = (h00 * x_idxs + h01 * y_idxs + h02) / denom
-        src_y = (h10 * x_idxs + h11 * y_idxs + h12) / denom
-        
-        # 4. Bilinear Interpolation (Vectorized)
-        h_src, w_src = src.shape[:2]
-        src_x = np.clip(src_x, 0, w_src - 1)
-        src_y = np.clip(src_y, 0, h_src - 1)
-        
-        # Get integer and fractional parts
-        x0 = np.floor(src_x).astype(np.int32)
-        y0 = np.floor(src_y).astype(np.int32)
-        x1 = x0 + 1
-        y1 = y0 + 1
-        
-        # Calculate weights
-        dx = src_x - x0
-        dy = src_y - y0
-        
-        # Clamp coordinates to image bounds
-        x0 = np.clip(x0, 0, w_src - 1)
-        x1 = np.clip(x1, 0, w_src - 1)
-        y0 = np.clip(y0, 0, h_src - 1)
-        y1 = np.clip(y1, 0, h_src - 1)
-        
-        # Sample pixels
-        # If image is grayscale (2D) vs Color (3D)
         if src.ndim == 2:
-            Ia = src[y0, x0]
-            Ib = src[y1, x0]
-            Ic = src[y0, x1]
-            Id = src[y1, x1]
-            
-            # Bilinear Formula: 
-            # val = Ia*(1-dx)(1-dy) + Ib*(1-dx)dy + Ic*dx(1-dy) + Id*dx*dy
-            wa = (1 - dx) * (1 - dy)
-            wb = (1 - dx) * dy
-            wc = dx * (1 - dy)
-            wd = dx * dy
-            
-            warped = (Ia * wa + Ib * wb + Ic * wc + Id * wd)
-            
+            output = np.zeros((height, width), dtype=src.dtype)
         else:
-            # For 3 Channel images, operations broadcast automatically
-            Ia = src[y0, x0]
-            Ib = src[y1, x0]
-            Ic = src[y0, x1]
-            Id = src[y1, x1]
-            
-            wa = (1 - dx) * (1 - dy)
-            wb = (1 - dx) * dy
-            wc = dx * (1 - dy)
-            wd = dx * dy
-            
-            # Reshape weights for broadcasting: (H, W) -> (H, W, 1)
-            warped = (Ia * wa[..., None] + Ib * wb[..., None] + 
-                      Ic * wc[..., None] + Id * wd[..., None])
+            output = np.zeros((height, width, src.shape[2]), dtype=src.dtype)
 
-        return warped.astype(np.uint8)
+        for y_start in range(0, height, tile_height):
+            y_end = min(y_start + tile_height, height)
+            tile_h = y_end - y_start
+
+            x_idxs, y_idxs = np.meshgrid(np.arange(width), np.arange(y_start, y_end))
+
+            denom = h20 * x_idxs + h21 * y_idxs + h22
+            valid_mask = np.abs(denom) > 1e-6
+            denom[~valid_mask] = 1.0
+
+            src_x = (h00 * x_idxs + h01 * y_idxs + h02) / denom
+            src_y = (h10 * x_idxs + h11 * y_idxs + h12) / denom
+
+            warped_tile = CustomCV2._bilinear_sample(
+                src, src_x, src_y
+            )
+            output[y_start:y_end, :] = warped_tile
+
+        return output
     
     @staticmethod
     def cornerSubPix(image: np.ndarray, corners: np.ndarray, winSize: Tuple[int, int],
@@ -708,7 +632,7 @@ class CustomCV2:
         raise NotImplementedError("cornerSubPix needs implementation")
     
     @staticmethod
-    def resize(src: np.ndarray, dsize: Tuple[int, int], interpolation: int = INTER_LINEAR) -> np.ndarray:
+    def resize(src: np.ndarray, dsize: Tuple[int, int], interpolation: int) -> np.ndarray:
         dst_w, dst_h = dsize
         src_h, src_w = src.shape[:2]
 
@@ -770,6 +694,37 @@ class CustomCV2:
             return normalized_pts.reshape(-1, 1, 2).astype(np.float32)
         else:
             return normalized_pts.astype(np.float32)
+
+    @staticmethod
+    def bilateralFilter(src: np.ndarray, d: int, sigmaColor: float, sigmaSpace: float) -> np.ndarray:
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.bilateralFilter_cpp(src, d, sigmaColor, sigmaSpace)
+        radius = d // 2
+        kernel_size = 2 * radius + 1
+
+        padded = np.pad(src, ((radius, radius), (radius, radius)), mode='reflect').astype(np.float32)
+        src_f = src.astype(np.float32)
+
+        results_num = np.zeros_like(src_f)
+        results_den = np.zeros_like(src_f)
+
+        y_idx, x_idx = np.meshgrid(np.arange(-radius, radius + 1), np.arange(-radius, radius + 1))
+        spatial_kernel = np.exp(-(x_idx**2 + y_idx**2) / (2 * sigmaSpace**2))
+
+        for ky in range(kernel_size):
+            for kx in range(kernel_size):
+                neighbor = padded[ky : ky + src.shape[0], kx : kx + src.shape[1]]
+
+                diff_sq = (neighbor - src_f) ** 2
+                range_weight = np.exp(-diff_sq / (2 * sigmaColor**2))
+
+                total_weight = spatial_kernel[ky, kx] * range_weight
+
+                results_num += neighbor * total_weight
+                results_den += total_weight
+        
+        output = results_num / (results_den + 1e-10)
+        return np.clip(output, 0, 255).astype(src.dtype)
 
     @staticmethod
     def normalize(src: np.ndarray, dst: Optional[np.ndarray], alpha: float, 
