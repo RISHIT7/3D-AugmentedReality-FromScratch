@@ -10,10 +10,10 @@
 namespace py = pybind11;
 
 inline int sample_cell(const uint8_t* img,  const int start, const float cell_size, const int r, const int c, const int side) {
-    int y_s = static_cast<int>(start + (r + 0.3f) * cell_size);
-    int x_s = static_cast<int>(start + (c + 0.3f) * cell_size);
-    int y_e = static_cast<int>(start + (r + 0.7f) * cell_size);
-    int x_e = static_cast<int>(start + (c + 0.7f) * cell_size);
+    int y_s = static_cast<int>(start + (r + 0.4f) * cell_size);
+    int x_s = static_cast<int>(start + (c + 0.4f) * cell_size);
+    int y_e = static_cast<int>(start + (r + 0.5f) * cell_size);
+    int x_e = static_cast<int>(start + (c + 0.5f) * cell_size);
 
     y_s = std::max(y_s, 0);
     x_s = std::max(x_s, 0);
@@ -520,9 +520,9 @@ py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
 py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
     auto buf_warped = warped.request();
     int SIDE = buf_warped.shape[0];
-    // if (SIDE < 64) {
-    //     return py::make_tuple(py::none(), py::none());
-    // }
+    if (SIDE < 64) {
+        return py::make_tuple(py::none(), py::none());
+    }
 
     const uint8_t* raw_warped = (uint8_t*)buf_warped.ptr;
 
@@ -563,7 +563,7 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
         }
     }
 
-    if (max_val < 127) {
+    if (max_val < 155) {
         return py::make_tuple(py::none(), py::none());
     }
 
@@ -575,14 +575,20 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
     };
 
     int tag_id = 0;
+    std::vector<int> debug_bits(4);
     for (int r = 0; r < 4; r++) {
         int br = bit_map[status][r][0];
         int bc = bit_map[status][r][1];
 
         int val = sample_cell(raw_warped, start, core_cell, br, bc, SIDE);
-        int bit = (val > 127) ? 1 : 0;
+        debug_bits[r] = val;
+        int bit = (val > 155) ? 1 : 0;
         tag_id |= (bit << r);
     }
+    // if (tag_id == 7)
+    // {
+    //     std::cout << "Debug Bits: " << debug_bits[0] << ", " << debug_bits[1] << ", " << debug_bits[2] << ", " << debug_bits[3] << std::endl;
+    // }
     return py::make_tuple(tag_id, status);
 }
 

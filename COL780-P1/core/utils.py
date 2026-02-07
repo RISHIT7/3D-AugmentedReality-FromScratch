@@ -174,13 +174,20 @@ def decode_tag(warped_tag: np.ndarray, MIN_TAG_AREA: float, MAX_TAG_AREA: float,
     Returns:
         (tag_id, orientation) or (None, None) if invalid
     """
+
     kernel = np.array([[0, -1, 0],
                         [-1, 5, -1],
                         [0, -1, 0]], dtype=np.float32)
+    
     sharpened = cv2.filter2D(warped_tag, -1, kernel)
+    
+    min_val = np.min(sharpened)
+    max_val = np.max(sharpened)
+    warped_tag = ((sharpened - min_val) / (max_val - min_val + 1e-5) * 255).astype(np.uint8)
     if CPP_AVAILABLE:
-        cv2.imshow("CPP Warped", warped_tag)
         res_tag_id, res_orientation = custom_cv2_cpp.decode_tag_cpp(warped_tag)
+        if res_tag_id == 7:
+            cv2.imshow("CPP Warped", warped_tag)
         if (res_tag_id is None or res_orientation is None) and depth < 1:
             kernel = np.array([[0, -1, 0],
                                [-1, 5, -1],
@@ -282,7 +289,6 @@ def process_frame(frame):
 
 def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper, depth=0):
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
-
     raw_candidates = []
     processed_centers = []
 
@@ -311,8 +317,9 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper, depth=0):
             if depth == 1:
                 cv2.imshow("Debug Warped", warped)
             result = decode_tag(warped, MIN_TAG_AREA, MAX_TAG_AREA, depth)
-            if depth == 1:
-                print(f"Debug Decoded Tag: {result}")
+            # print("General Decoded Result:", result)
+            # if depth == 1:
+                # print(f"Debug Decoded Tag: {result}")
             if result[0] is not None:
                 tag_id, orient_idx = result
                 rect = np.roll(rect, -orient_idx, axis=0)
