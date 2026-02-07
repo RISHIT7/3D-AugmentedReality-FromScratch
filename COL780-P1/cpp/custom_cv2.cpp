@@ -9,6 +9,10 @@
 
 namespace py = pybind11;
 
+inline int get_center_coord(int idx, float cell_size) {
+    return static_cast<int>((idx + 0.5f) * cell_size);
+}
+
 inline int sample_cell(const uint8_t* img,  const int start, const float cell_size, const int r, const int c, const int side) {
     int y_s = static_cast<int>(start + (r + 0.4f) * cell_size);
     int x_s = static_cast<int>(start + (c + 0.4f) * cell_size);
@@ -43,6 +47,25 @@ inline double get_dist_sq(int x1, int y1, int x2, int y2) {
     double dx = static_cast<double>(x1) - static_cast<double>(x2);
     double dy = static_cast<double>(y1) - static_cast<double>(y2);
     return dx * dx + dy * dy;
+}
+
+inline void gaussian_blur_1d(const std::vector<float>& input, std::vector<float>& output, int size) {
+    const float kernel[5] = {1.0f/16.0f, 4.0f/16.0f, 6.0f/16.0f, 4.0f/16.0f, 1.0f/16.0f};
+    output.resize(size);
+
+    for (int i = 0; i < size; i++) {
+        float sum = 0.0f;
+        float weight_sum = 0.0f;
+
+        for (int k = -2; k <= 2; k++) {
+            int idx = i + k;
+            if (idx >= 0 && idx < size) {
+                sum += input[idx] * kernel[k + 2];
+                weight_sum += kernel[k + 2];
+            }
+        }
+        output[i] = sum / weight_sum;
+    }
 }
 
 bool normalize_invert_3x3(const double* mat, double* invMat) {
@@ -519,55 +542,125 @@ py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
 
 py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
     auto buf_warped = warped.request();
-    int SIDE = buf_warped.shape[0];
-    if (SIDE < 64) {
+
+    if (buf_warped.ndim != 2)
+    {
         return py::make_tuple(py::none(), py::none());
     }
 
-    const uint8_t* raw_warped = (uint8_t*)buf_warped.ptr;
+    int SIDE = static_cast<int>(buf_warped.shape[0]);
+    int width = static_cast<int>(buf_warped.shape[1]);
+    if (SIDE != width || SIDE < 64) {
+        return py::make_tuple(py::none(), py::none());
+    }
+
+    const uint8_t* raw_warped = static_cast<const uint8_t*>(buf_warped.ptr);
 
     float cell_size = static_cast<float>(SIDE) / 8.0f;
-    int margin  = (int)(cell_size / 2);
-    if (margin < 1) margin = 1;
+    int margin  = std::max(1, static_cast<int>(cell_size *0.5f));
+    margin = std::min(margin, SIDE / 4);
 
-    int border_threshold = 150;
+    const int border_threshold = 150;
 
     for (int i = 0; i < 8; i++) {
         int idx = (int) (( i + 0.5f) * cell_size);
+        if (idx < 0 || idx >= SIDE) continue;
         if (raw_warped[margin * SIDE + idx] > border_threshold) return py::make_tuple(py::none(), py::none());
         if (raw_warped[(SIDE - 1 - margin) * SIDE + idx] > border_threshold) return py::make_tuple(py::none(), py::none());
     }   
 
     for (int i = 0; i < 8; i++) {
         int idx = (int) (( i + 0.5f) * cell_size);
+        if (idx < 0 || idx >= SIDE) continue;
         if (raw_warped[idx * SIDE + margin] > border_threshold) return py::make_tuple(py::none(), py::none());
         if (raw_warped[idx * SIDE + (SIDE - 1 - margin)] > border_threshold) return py::make_tuple(py::none(), py::none());
     }
 
-    int start = (int) (2 * cell_size);
-    int end = (int) ((6) * cell_size);
-    float core_cell = (end - start) / 4.0f;
+    const int CORE_INDICES[4] = {2, 3, 4, 5};
+    const float ORIENTATION_THRESHOLD = 155.0f;
+    const float ADAPTIVE_THRESH_MIN_RANGE = 30.0f;
+    const int MAX_TAG_ID = 15;
 
-    int anchors[4];
-    anchors[0] = sample_cell(raw_warped, start, core_cell, 3, 3, SIDE);
-    anchors[1] = sample_cell(raw_warped, start, core_cell, 3, 0, SIDE);
-    anchors[2] = sample_cell(raw_warped, start, core_cell, 0, 0, SIDE);
-    anchors[3] = sample_cell(raw_warped, start, core_cell, 0, 3, SIDE);
+    uint8_t grid_bits[4][4] = {{0}};
+    float grid_intensities[4][4] = {{0.0f}};
 
-    int max_val = -1;
-    int status = -1;
-    for (int i = 0; i < 4; i++) {
-        if (anchors[i] > max_val) {
-            max_val = anchors[i];
-            status = i;
+    for (int r_idx = 0; r_idx < 4; ++r_idx) {
+        int grid_row = CORE_INDICES[r_idx];
+        int y = get_center_coord(grid_row, cell_size);
+
+        if (y < 0 || y >= SIDE) {
+            return py::make_tuple(py::none(), py::none());
+        }
+
+        std::vector<float> row_signal(SIDE);
+        for (int x = 0; x < SIDE; ++x) {
+            row_signal[x] = static_cast<float>(raw_warped[y * SIDE + x]);
+        }
+
+        std::vector<float> blurred_row;
+        gaussian_blur_1d(row_signal, blurred_row, SIDE);
+
+        float row_value[4];
+        for (int c_idx = 0; c_idx < 4; ++c_idx) {
+            int x = get_center_coord(CORE_INDICES[c_idx], cell_size);
+            if (x < 0 || x >= SIDE) {
+                return py::make_tuple(py::none(), py::none());
+            }
+
+            row_value[c_idx] = blurred_row[x];
+        }
+
+        int data_start_x = static_cast<int>(2 * cell_size);
+        int data_end_x = static_cast<int>(6 * cell_size);
+
+        data_start_x = std::max(0, std::min(data_start_x, SIDE - 1));
+        data_end_x = std::max(data_start_x + 1, std::min(data_end_x, SIDE));
+
+        float local_min = blurred_row[data_start_x];
+        float local_max = blurred_row[data_start_x];
+
+        for (int x = data_start_x; x < data_end_x; x++) {
+            local_min = std::min(local_min, blurred_row[x]);
+            local_max = std::max(local_max, blurred_row[x]);
+        }
+
+        float row_threshold = (local_min + local_max) * 0.5f;
+
+        if ((local_max - local_min) < ADAPTIVE_THRESH_MIN_RANGE) {
+            row_threshold = 155.0f;
+        }
+
+        for (int c_idx = 0; c_idx < 4; ++c_idx) {
+            grid_intensities[r_idx][c_idx] = row_value[c_idx];
+            grid_bits[r_idx][c_idx] = (row_value[c_idx] > row_threshold) ? 1 : 0;
         }
     }
 
-    if (max_val < 155) {
+    float anchor_values[4] = {
+        grid_intensities[3][3],
+        grid_intensities[3][0],
+        grid_intensities[0][0],
+        grid_intensities[0][3]
+    };
+
+    int status = 0;
+    float max_val = anchor_values[0];
+    for (int i = 1; i < 4; i++) {
+        if (anchor_values[i] > max_val) {
+            max_val = anchor_values[i];
+            status = i;
+        }
+    }
+    for (auto val: anchor_values) {
+        std::cout << val << " ";
+    }
+    std::cout << "Status: " << status << std::endl;
+
+    if (max_val < ORIENTATION_THRESHOLD) {
         return py::make_tuple(py::none(), py::none());
     }
 
-    int bit_map[4][4][2] = {
+    const int bit_map[4][4][2] = {
         {{1, 1}, {1, 2}, {2, 2}, {2, 1}},
         {{1, 2}, {2, 2}, {2, 1}, {1, 1}},
         {{2, 2}, {2, 1}, {1, 1}, {1, 2}},
@@ -575,20 +668,17 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
     };
 
     int tag_id = 0;
-    std::vector<int> debug_bits(4);
-    for (int r = 0; r < 4; r++) {
+    for (int r = 0; r < 4; ++r) {
         int br = bit_map[status][r][0];
         int bc = bit_map[status][r][1];
-
-        int val = sample_cell(raw_warped, start, core_cell, br, bc, SIDE);
-        debug_bits[r] = val;
-        int bit = (val > 155) ? 1 : 0;
+        uint8_t bit = grid_bits[br][bc];
         tag_id |= (bit << r);
     }
-    // if (tag_id == 7)
-    // {
-    //     std::cout << "Debug Bits: " << debug_bits[0] << ", " << debug_bits[1] << ", " << debug_bits[2] << ", " << debug_bits[3] << std::endl;
-    // }
+
+    if (tag_id < 0 || tag_id > MAX_TAG_ID) {
+        return py::make_tuple(py::none(), py::none());
+    }
+
     return py::make_tuple(tag_id, status);
 }
 
