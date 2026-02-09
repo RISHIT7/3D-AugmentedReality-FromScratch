@@ -25,6 +25,9 @@ class CustomCV2:
     RETR_TREE = 3
     CHAIN_APPROX_SIMPLE = 2
 
+    update_freq: int = 10
+    min_pixels: int = 256
+
     @staticmethod
     def _make_gaussian_kernel(ksize: int, sigmaX: float) -> np.ndarray:
         ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
@@ -39,7 +42,7 @@ class CustomCV2:
 
     @staticmethod
     def _compute_otsu_threshold(src: np.ndarray) -> float:
-        if src.size < CustomCV2._threshold_config.min_pixels:
+        if src.size < CustomCV2.min_pixels:
             return float(np.median(src))
         
         hist, _ = np.histogram(src.ravel(), bins=256, range=(0, 256))
@@ -64,7 +67,7 @@ class CustomCV2:
     @staticmethod
     def _compute_temporal_threshold(src: np.ndarray) -> float:
         thresh, count = CustomCV2._threshold_state.get_and_increment()
-        if count % CustomCV2._threshold_config.update_freq == 0:
+        if count % CustomCV2.update_freq == 0:
             new_thresh = CustomCV2._compute_otsu_threshold(src)
             CustomCV2._threshold_state.update(new_thresh)
             return new_thresh

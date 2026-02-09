@@ -654,7 +654,7 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
             status = i;
         }
     }
-    
+
     if (max_val < ORIENTATION_THRESHOLD) {
         return py::make_tuple(py::none(), py::none());
     }
@@ -674,124 +674,78 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
         tag_id |= (bit << r);
     }
 
+    if (tag_id == 12)
+    {
+        for (int x = 0; x < 4; ++x) {
+            for (int y = 0; y < 4; ++y) {
+                std::cout << (int)grid_intensities[x][y] << " ";
+            }
+            std::cout << std::endl;
+        }
+    }
+
     if (tag_id < 0 || tag_id > MAX_TAG_ID) {
         return py::make_tuple(py::none(), py::none());
     }
-    std::cout << "Decoded tag ID: " << tag_id << ", Status: " << status << std::endl;
     return py::make_tuple(tag_id, status);
 }
 
 py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d, double sigmaColor, double sigmaSpace) {
     auto buf_src = src.request();
-
-    bool is_color = (buf_src.ndim == 3 && buf_src.shape[2] == 3);
     int s_h = buf_src.shape[0];
     int s_w = buf_src.shape[1];
-    int channels = is_color ? buf_src.shape[2] : 1;
 
-    if (is_color && channels != 3) {
-        throw std::runtime_error("Input image must have 3 channels (H, W, 3) for color images");
-    }
-
+    py::array_t<uint8_t> result = py::array_t<uint8_t>({s_h, s_w});
     const uint8_t* raw_src = (uint8_t*)buf_src.ptr;
-    py::array_t<uint8_t> result;
-    if (is_color) {
-        result = py::array_t<uint8_t>({s_h, s_w, channels});
-    } else {
-        result = py::array_t<uint8_t>({s_h, s_w});
-    }
-
     uint8_t* raw_dst = (uint8_t*)result.request().ptr;
 
     int radius = d / 2;
     int kernel_size = 2 * radius + 1;
 
-    std::vector<float> spatial_kernel(kernel_size * kernel_size);
-    float spatial_coeff = -1.0f / (2 * sigmaSpace * sigmaSpace);
+    std::vector<float> space_weights(kernel_size * kernel_size);
+    std::vector<float> space_offs_x(kernel_size * kernel_size);
+    std::vector<float> space_offs_y(kernel_size * kernel_size);
+    float space_coeff = -0.5f / (sigmaSpace * sigmaSpace);
 
+    int k_idx = 0;
     for (int y = -radius; y <= radius; y++) {
         for (int x = -radius; x <= radius; x++) {
             float r2 = static_cast<float>(x * x + y * y);
-            spatial_kernel[(y + radius) * kernel_size + (x + radius)] = std::exp(r2 * spatial_coeff);
+            space_weights[k_idx] = std::exp(r2 * space_coeff);
+            space_offs_x[k_idx] = x;
+            space_offs_y[k_idx] = y;
+            k_idx++;
         }
     }
 
-    float range_coeff = -1.0f / (2 * sigmaColor * sigmaColor);
-    std::vector<float> range_kernel(256);
+    float range_coeff = -0.5f / (sigmaColor * sigmaColor);
+    std::vector<float> range_weights(256);
     for (int i = 0; i < 256; i++) {
-        range_kernel[i] = std::exp((i * i) * range_coeff);
+        range_weights[i] = std::exp(i * i * range_coeff);
     }
 
     #pragma omp parallel for collapse(2)
     for (int y = 0; y < s_h; y++) {
+        const uint8_t* row_ptr = raw_src + y * s_w;
+        uint8_t* dst_row_ptr = raw_dst + y * s_w;
+
         for (int x = 0; x < s_w; x++) {
-            if (is_color) {
-                float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f, weight_sum = 0.0f;
-                int center_idx = (y * s_w + x) * 3;
-                int center_b = raw_src[center_idx];
-                int center_g = raw_src[center_idx + 1];
-                int center_r = raw_src[center_idx + 2];
+            float sum = 0.0f;
+            float w_sum = 0.0f;
+            int center_val = row_ptr[x];
 
-                for (int ky = -radius; ky <= radius; ky++) {
-                    int ny = y + ky;
-                    if (ny < 0 || ny >= s_h) continue;
-                    for (int kx = -radius; kx <= radius; kx++) {
-                        int nx = x + kx;
-                        if (nx < 0 || nx >= s_w) continue;
+            for (int k = 0; k < kernel_size * kernel_size; k++) {
+                int nx = x + static_cast<int>(space_offs_x[k]);
+                int ny = y + static_cast<int>(space_offs_y[k]);
 
-                        int idx = (ny * s_w + nx) * 3;
-                        int neighbour_b = raw_src[idx];
-                        int neighbour_g = raw_src[idx + 1];
-                        int neighbour_r = raw_src[idx + 2];
-
-                        int diff_b = neighbour_b - center_b;
-                        int diff_g = neighbour_g - center_g;
-                        int diff_r = neighbour_r - center_r;
-
-                        float color_dist_sq = static_cast<float>(diff_b * diff_b + diff_g * diff_g + diff_r * diff_r);
-                        int kernel_idx = (ky + radius) * kernel_size + (kx + radius);
-                        float weight = spatial_kernel[kernel_idx] * range_kernel[static_cast<int>(std::sqrt(color_dist_sq))];
-
-                        sum_b += neighbour_b * weight;
-                        sum_g += neighbour_g * weight;
-                        sum_r += neighbour_r * weight;
-                        weight_sum += weight;
-                    }
-                }
-                if (weight_sum > 1e-6) {
-                    raw_dst[center_idx] = clip_u8(sum_b / weight_sum);
-                    raw_dst[center_idx + 1] = clip_u8(sum_g / weight_sum);
-                    raw_dst[center_idx + 2] = clip_u8(sum_r / weight_sum);
-                } else {
-                    raw_dst[center_idx] = center_b;
-                    raw_dst[center_idx + 1] = center_g;
-                    raw_dst[center_idx + 2] = center_r;
-                } 
-            } else {
-                float sum_val = 0.0f, weight_sum = 0.0f;
-
-                int center_val = raw_src[y * s_w + x];
-                for (int ky = -radius; ky <= radius; ky++) {
-                    int ny = y + ky;
-                    if (ny < 0 || ny >= s_h) continue;
-                    for (int kx = -radius; kx <= radius; kx++) {
-                        int nx = x + kx;
-                        if (nx < 0 || nx >= s_w) continue;
-
-                        int neighbour_val = raw_src[ny * s_w + nx];
-                        int diff = std::abs(neighbour_val - center_val);
-                        float weight = spatial_kernel[(ky + radius) * kernel_size + (kx + radius)] * range_kernel[diff];
-
-                        sum_val += neighbour_val * weight;
-                        weight_sum += weight;
-                    }
-                }
-                if (weight_sum > 1e-6) {
-                    raw_dst[y * s_w + x] = clip_u8(sum_val / weight_sum);
-                } else {
-                    raw_dst[y * s_w + x] = center_val;
+                if (nx >= 0 && nx < s_w && ny >= 0 && ny < s_h) {
+                    int neighbor_val = raw_src[ny * s_w + nx];
+                    float weight = space_weights[k] * range_weights[std::abs(neighbor_val - center_val)];
+                    sum += neighbor_val * weight;
+                    w_sum += weight;
                 }
             }
+            dst_row_ptr[x] = clip_u8(sum / w_sum);
         }
     }
     return result;
