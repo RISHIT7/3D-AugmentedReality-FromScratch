@@ -69,6 +69,8 @@ TAG_BORDER_WIDTH = 1
 CENTER_PROXIMITY_THRESH_SQUARED = 400
 CORE_START_CELL = 2
 CORE_END_CELL = 6
+warper_main = GatedWarper()
+warper_secondary = GatedWarper()
 
 class OBJ:
     def __init__(self, filename, swapyz=False):
@@ -142,24 +144,52 @@ def render(img, obj, projection, model, color=False):
 
 def order_points(pts):
     pts = pts.reshape(4, 2)
-    center = pts.mean(axis=0)
 
-    angles = np.arctan2(pts[:,1] - center[1], pts[:,0] - center[0])
-    sorted_idx = np.argsort(angles)
-    sorted_pts = pts[sorted_idx]
-    
-    top_left_idx = np.argmin(np.sum(sorted_pts, axis=1))
-    rect = np.roll(sorted_pts[::-1], top_left_idx-3, axis=0)
-    
-    return rect
+    x_sorted = pts[np.argsort(pts[:, 0])]
+
+    left = x_sorted[:2]
+    right = x_sorted[2:]
+
+    left = left[np.argsort(left[:, 1])]
+    (tl, bl) = left
+
+    right = right[np.argsort(right[:, 1])]
+    (tr, br) = right
+    res = np.array([tl, tr, br, bl], dtype="float32")
+    return res
 
 
 def refine_corners(gray, corners):
     criteria = (CustomCV2.TERM_CRITERIA_EPS + CustomCV2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     return cv2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
 
+def sharpen_and_normalize(warped_tag):
+    kernel = np.array([[0, -1, 0],
+                        [-1, 5, -1],
+                        [0, -1, 0]], dtype=np.float32)
+    sharpened = cv2.filter2D(warped_tag, -1, kernel)
+    min_val = np.min(sharpened)
+    max_val = np.max(sharpened)
+    normalized = ((sharpened - min_val) / (max_val - min_val + 1e-5) * 255).astype(np.uint8)
+    return normalized
 
-def decode_tag(warped_tag: np.ndarray):
+def check_border(processed, cell, margin):
+    side = processed.shape[0]
+    indices = np.clip(((np.arange(TAG_BORDER_WIDTH) + 0.5) * cell).astype(int), 0, side - 1)
+    for idx in indices:
+        if processed[margin, idx] > 127:
+            return False
+        if processed[side - margin - 1, idx] > 127:
+            return False
+    
+    for idx in indices:
+        if processed[idx, margin] > 127:
+            return False
+        if processed[idx, side - margin - 1] > 127:
+            return False
+    return True
+
+def decode_tag(warped_tag: np.ndarray, MIN_TAG_AREA: float, MAX_TAG_AREA: float, depth=0):
     """
     Decode AR tag from warped image.
     
@@ -169,59 +199,68 @@ def decode_tag(warped_tag: np.ndarray):
     Returns:
         (tag_id, orientation) or (None, None) if invalid
     """
+    sharpened = sharpen_and_normalize(warped_tag)
+    threshold = CustomCV2.threshold(sharpened, 0, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
     if CPP_AVAILABLE:
-        return custom_cv2_cpp.decode_tag_cpp(warped_tag)
-    cv2.imshow("Warped Tag", warped_tag)
-    # Threshold the image
-    _, thresh = CustomCV2.threshold(warped_tag, 155, 255, CustomCV2.THRESH_BINARY)
-    side = thresh.shape[0]
-    
+        res_tag_id, res_orientation = custom_cv2_cpp.decode_tag_cpp(threshold)
+        if res_tag_id == 12:
+            print("Debugging Tag ID:", res_tag_id, "orientation:", res_orientation, "Depth:", depth)
+            cv2.imshow("Debug Warped", warped_tag)
+        if (res_tag_id is None or res_orientation is None) and depth < 1:
+            thresh = CustomCV2.threshold(sharpened, 0, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
+            process_contours(sharpened, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_secondary, depth=1)
+        return res_tag_id, res_orientation
+    side = threshold.shape[0]
     # Validate minimum size
     if side < 64:
         return None, None
     
     cell = side / TAG_GRID_SIZE
     margin = max(1, int(cell / 2))
-    margin = min(margin, side // 4)  # Safety clamp
-    
-    # Vectorized border sampling
-    indices = np.clip(((np.arange(8) + 0.5) * cell).astype(int), 0, side - 1)
-    
-    border_samples = np.concatenate([
-        thresh[margin, indices],
-        thresh[indices, side - margin - 1],
-        thresh[side - margin - 1, indices][::-1],
-        thresh[indices, margin][::-1]
-    ])
-    
-    # Check border (should be black)
-    if np.any(border_samples > 150):
+    margin = min(margin, side // 4)
+
+    if not check_border(threshold, cell, margin):
         return None, None
 
-    # Extract core region
-    start = int(CORE_START_CELL * cell)
-    end = int(CORE_END_CELL * cell)
-    core_size = end - start
-    core_cell = core_size / 4.0
-    def get_core_val(r: int, c: int) -> float:
-        """Sample center 40% of a core cell"""
-        y_start = max(0, int(start + (r + 0.3) * core_cell))
-        y_end = min(side, int(start + (r + 0.7) * core_cell))
-        x_start = max(0, int(start + (c + 0.3) * core_cell))
-        x_end = min(side, int(start + (c + 0.7) * core_cell))
-        
-        if y_end <= y_start or x_end <= x_start:
-            return 0
-        
-        return float(np.mean(thresh[y_start:y_end, x_start:x_end]))
+    core_indices = [2, 3, 4, 5]
 
-    # Find orientation using anchor corners
-    anchors = [(3, 3), (3, 0), (0, 0), (0, 3)]
-    intensities = [get_core_val(r, c) for r, c in anchors]
-    status = int(np.argmax(intensities))
+    def get_center_coord(idx):
+        return int((idx + 0.5) * cell)
+
+    grid_bits = np.zeros((4, 4), dtype=np.uint8)
+    grid_intensities = np.zeros((4, 4), dtype=np.float32)
+
+    for r_idx, grid_row in enumerate(core_indices):
+        y = get_center_coord(grid_row)
+        row_signal = threshold[y, :]
+        row_signal = CustomCV2.GaussianBlur(row_signal.reshape(-1, 1).astype(float), (5,1), 16)
+        col_coords = [get_center_coord(c_idx) for c_idx in core_indices]
+        row_values = [row_signal[c] for c in col_coords]
+        data_start_x = int(2 * cell)
+        data_end_x = int(6 * cell)
+        segment = row_signal[data_start_x:data_end_x]
+        local_min = np.min(segment)
+        local_max = np.max(segment)
+        row_thresh = (local_min + local_max) / 2
+        if (local_max - local_min) < 30:
+            row_thresh = 155
+
+        for c_idx, val in enumerate(row_values):
+            grid_intensities[r_idx, c_idx] = val
+            if val > row_thresh:
+                grid_bits[r_idx, c_idx] = 1
+            else:
+                grid_bits[r_idx, c_idx] = 0
     
-    # Validate orientation marker
-    if intensities[status] < 127:
+    anchors_vals = [
+        grid_intensities[3, 3],
+        grid_intensities[3, 0],
+        grid_intensities[0, 0],
+        grid_intensities[0, 3]
+    ]
+    status = int(np.argmax(anchors_vals))
+
+    if anchors_vals[status] < 127:
         return None, None
 
     # Decode data bits based on orientation
@@ -232,27 +271,35 @@ def decode_tag(warped_tag: np.ndarray):
         3: [(2, 1), (1, 1), (1, 2), (2, 2)]
     }
 
-    bits = [1 if get_core_val(r, c) > 127 else 0 for r, c in bit_map[status]]
-    tag_id = (bits[3] << 3 | bits[2] << 2 | bits[1] << 1 | bits[0])
-    
-    # Validate tag ID range
-    if tag_id > 15:  # 4-bit ID should be 0-15
+    try:
+        data_bits = [grid_bits[r, c] for r, c in bit_map[status]]
+    except KeyError:
         return None, None
-    
+    tag_id = (data_bits[0] << 0) | (data_bits[1] << 1) | (data_bits[2] << 2) | (data_bits[3] << 3)
     return tag_id, status
-
 
 def process_frame(frame):
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 
     MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9    
 
-    warper = GatedWarper()
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
 
-    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 7) 
-    contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
+    blurred = CustomCV2.bilateralFilter(gray, 9, 75, 75)
+    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, 11, 7) 
+    stable_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper_main, depth=0)
 
+    for tag in stable_tags:
+        rect = tag["corners"]
+        cv2.polylines(frame, [np.int32(rect)], True, (0, 255, 0), 2)
+        cv2.putText(frame, f"ID: {tag['id']}", tuple(np.int32(rect[0])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"Rot: {tag['rotation']} deg", tuple(np.int32(rect[1])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+    return frame, stable_tags
+
+def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA, warper, depth=0):
+    contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
     raw_candidates = []
     processed_centers = []
 
@@ -278,8 +325,10 @@ def process_frame(frame):
             rect = order_points(quad)
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
             warped = warper.process(gray, H, SIDE, SIDE)
-            result = decode_tag(warped)
-            
+            result = decode_tag(warped, MIN_TAG_AREA, MAX_TAG_AREA, depth)
+            # print("General Decoded Result:", result)
+            # if depth == 1:
+                # print(f"Debug Decoded Tag: {result}")
             if result[0] is not None:
                 tag_id, orient_idx = result
                 rect = np.roll(rect, -orient_idx, axis=0)
@@ -288,12 +337,4 @@ def process_frame(frame):
 
     stable_tags = raw_candidates
     
-    for tag in stable_tags:
-        rect = tag["corners"]
-        cv2.polylines(frame, [np.int32(rect)], True, (0, 255, 0), 2)
-        cv2.putText(frame, f"ID: {tag['id']}", tuple(np.int32(rect[0])), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(frame, f"Rot: {tag['rotation']} deg", tuple(np.int32(rect[1])), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-    return frame, stable_tags
+    return stable_tags
