@@ -869,7 +869,7 @@ py::array_t<float> cornerSubPix_cpp(const py::array_t<uint8_t> image, py::array_
         r_result(i, 0, 1) = cy;
     }
 
-    return result;  
+    return result;
 }
 
 PYBIND11_MODULE(custom_cv2_cpp, m) {
