@@ -751,6 +751,127 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d, 
     return result;
 }
 
+py::array_t<uint8_t> sharpenAndNormalize_cpp(const py::array_t<uint8_t> src) {
+    auto buf_src = src.request();
+    int s_h = buf_src.shape[0];
+    int s_w = buf_src.shape[1];
+    const uint8_t* raw_src = (uint8_t*)buf_src.ptr;
+
+    auto result = py::array_t<uint8_t>({s_h, s_w});
+    auto raw_dst = (uint8_t*)result.request().ptr;
+
+    std::vector<float> temp(s_h * s_w);
+    float min_val = 1e9f;
+    float max_val = -1e9f;
+
+    #pragma omp parallel for collapse(2) reduction(min:min_val) reduction(max:max_val)
+    for (int y = 0; y < s_h; y++) {
+        for (int x = 0; x < s_w; x++) {
+            int c = raw_src[y * s_w + x];
+            int u = (y > 0) ? raw_src[(y - 1) * s_w + x] : c;
+            int d = (y < s_h - 1) ? raw_src[(y + 1) * s_w + x] : c;
+            int l = (x > 0) ? raw_src[y * s_w + (x - 1)] : c;
+            int r = (x < s_w - 1) ? raw_src[y * s_w + (x + 1)] : c;
+
+            float val = 5.0f * c - u - d - l - r;
+
+            temp[y * s_w + x] = val;
+            min_val = std::min(min_val, val);
+            max_val = std::max(max_val, val);
+        }
+    }
+
+    float range = max_val - min_val;
+    if (range < 1e-6f) {
+        range = 1.0f;
+    }
+
+    #pragma omp parallel for
+    for (int i = 0; i < s_h * s_w; i++) {
+        raw_dst[i] = clip_u8((temp[i] - min_val) * 255.0f / range);
+    }
+
+    return result;
+}
+
+py::array_t<float> cornerSubPix_cpp(const py::array_t<uint8_t> image, py::array_t<float> corners, int win_w, int win_h, int max_iter, double epsilon) {
+    auto buf_image = image.request();
+    int s_h = buf_image.shape[0];
+    int s_w = buf_image.shape[1];
+    const uint8_t* raw_image = (uint8_t*)buf_image.ptr;
+
+    auto buf_corners = corners.request();
+    int n_corners = buf_corners.shape[0];
+
+    py::array_t<float> result = py::array_t<float>({n_corners, 1, 2});
+    auto r_corners = corners.unchecked<3>();
+    auto r_result = result.mutable_unchecked<3>();
+
+    for (int i = 0; i < n_corners; i++) {
+        r_result(i, 0, 0) = r_corners(i, 0, 0);
+        r_result(i, 0, 1) = r_corners(i, 0, 1);
+    }
+
+    for (int i = 0; i < n_corners; i++) {
+        float cx = r_result(i, 0, 0);
+        float cy = r_result(i, 0, 1);
+
+        for (int iter = 0; iter < max_iter; iter++) {
+            float gx = 0, gy = 0;
+            double Gxx = 0, Gxy = 0, Gyy = 0;
+            double bx = 0, by = 0;
+
+            int Ix = static_cast<int>(cx);
+            int Iy = static_cast<int>(cy);
+
+            int left = std::max(1, Ix - win_w);
+            int right = std::min(s_w - 2, Ix + win_w);
+            int top = std::max(1, Iy - win_h);
+            int bottom = std::min(s_h - 2, Iy + win_h);
+
+            for (int y = top; y <= bottom; y++) {
+                const uint8_t* row_ptr = raw_image + y * s_w;
+                for (int x = left; x <= right; x++) {
+                    float dx = 0.5f * (row_ptr[x + 1] - row_ptr[x - 1]);
+                    float dy = 0.5f * (raw_image[(y + 1) * s_w + x] - raw_image[(y - 1) * s_w + x]);
+
+                    gx += dx;
+                    gy += dy;
+
+                    Gxx += dx * dx;
+                    Gxy += dx * dy;
+                    Gyy += dy * dy;
+
+                    bx += dx * dx * x + dx * dy * y;
+                    by += dx * dy * x + dy * dy * y;
+                }
+            }
+
+            double det = Gxx * Gyy - Gxy * Gxy;
+            if (std::abs(det) < 1e-9) {
+                break;
+            }
+            double inv_det = 1.0 / det;
+            double new_cx = (Gyy * bx - Gxy * by) * inv_det;
+            double new_cy = (Gxx * by - Gxy * bx) * inv_det;
+
+            double diff_x = new_cx - cx;
+            double diff_y = new_cy - cy;
+
+            cx = static_cast<float>(new_cx);
+            cy = static_cast<float>(new_cy);
+
+            if (diff_x * diff_x + diff_y * diff_y < epsilon * epsilon) {
+                break;
+            }
+        }
+        r_result(i, 0, 0) = cx;
+        r_result(i, 0, 1) = cy;
+    }
+
+    return result;  
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -789,4 +910,12 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("bilateralFilter_cpp", &bilateralFilter_cpp,
           py::arg("src"), py::arg("d"), py::arg("sigmaColor"), py::arg("sigmaSpace"),
           "Applies a bilateral filter to the input image with the specified diameter, sigmaColor, and sigmaSpace.");
+
+    m.def("sharpenAndNormalize_cpp", &sharpenAndNormalize_cpp,
+          py::arg("src"),
+          "Sharpens the input image using a simple kernel and normalizes the result to the full 0-255 range.");
+
+    m.def("cornerSubPix_cpp", &cornerSubPix_cpp,
+          py::arg("image"), py::arg("corners"), py::arg("win_w"), py::arg("win_h"), py::arg("max_iter"), py::arg("epsilon"),
+          "Refines corner locations to sub-pixel accuracy using the specified window size, maximum iterations, and convergence epsilon.");
 }

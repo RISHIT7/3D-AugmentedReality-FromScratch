@@ -3,6 +3,8 @@ from typing import Tuple, List, Optional
 
 import sys
 import os
+
+from torch import det
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import custom_cv2_cpp # type: ignore
@@ -110,6 +112,23 @@ class CustomCV2:
             return (src[y0, x0] * wa + src[y1, x0] * wb + src[y0, x1] * wc + src[y1, x1] * wd).astype(src.dtype)
 
     @staticmethod
+    def _manual_gradient_2d(img):
+        img = img.astype(np.float64)
+        grad_axis_0 = np.zeros_like(img)
+        grad_axis_1 = np.zeros_like(img)
+
+        grad_axis_0[1:-1, :] = (img[2:, :] - img[:-2, :]) / 2
+        grad_axis_1[:, 1:-1] = (img[:, 2:] - img[:, :-2]) / 2
+
+        grad_axis_0[0, :] = img[1, :] - img[0, :]
+        grad_axis_1[:, 0] = img[:, 1] - img[:, 0]
+
+        grad_axis_0[-1, :] = img[-1, :] - img[-2, :]
+        grad_axis_1[:, -1] = img[:, -1] - img[:, -2]
+
+        return grad_axis_0, grad_axis_1
+
+    @staticmethod
     def cvtColor(src: np.ndarray, code: int) -> np.ndarray:
         if CPP_AVAILABLE:
             return custom_cv2_cpp.cvtColor_cpp(src)
@@ -171,12 +190,89 @@ class CustomCV2:
         return np.clip(results, 0, 255).astype(src.dtype)
 
     @staticmethod
+    def sharpenAndNormalize(src: np.ndarray) -> np.ndarray:
+        if CPP_AVAILABLE:
+            return custom_cv2_cpp.sharpenAndNormalize_cpp(src)
+        
+        kernel = np.array([[0, -1, 0],
+                           [-1, 5, -1],
+                           [0, -1, 0]], dtype=np.float32)
+        
+        padded = np.pad(src, 1, mode='edge').astype(np.float32)
+        res = padded[1:-1, 1:-1] * kernel[1, 1]
+        res -= (padded[0:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, 0:-2] + padded[1:-1, 2:])
+
+        min_val, max_val = res.min(), res.max()
+
+        if (max_val - min_val) < 1e-5:
+            return np.zeros_like(src, dtype=np.uint8)
+        normalized = (res - min_val) * (255.0 / (max_val - min_val))
+        return np.clip(normalized, 0, 255).astype(np.uint8)
+    
+    @staticmethod
+    def cornerSubPix(image: np.ndarray, corners: np.ndarray, winSize: Tuple[int, int],
+                     zeroZone: Tuple[int, int], criteria: Tuple[int, int, float]) -> np.ndarray:
+        win_w, win_h = winSize
+        max_iter, epsilon = criteria[1], criteria[2]
+        if CPP_AVAILABLE:
+            c_in = corners.reshape(-1, 1, 2).astype(np.float32)
+            return custom_cv2_cpp.cornerSubPix_cpp(image, c_in, win_w, win_h, max_iter, epsilon)
+        
+        corners = corners.astype(np.float32).copy()
+        if corners.ndim == 3:
+            corners = corners.reshape(-1, 2)
+        
+        h, w = image.shape
+        img = image.astype(np.float32)
+        gx, gy = CustomCV2._manual_gradient_2d(img)
+
+        results = []
+        for (cx, cy) in corners:
+            curr_x, curr_y = cx, cy
+
+            for _ in range(max_iter):
+                x_min = max(0, int(curr_x) - win_w)
+                x_max = min(w, int(curr_x) + win_w + 1)
+                y_min = max(0, int(curr_y) - win_h)
+                y_max = min(h, int(curr_y) + win_h + 1)
+
+                Ix = gx[y_min:y_max, x_min:x_max]
+                Iy = gy[y_min:y_max, x_min:x_max]
+
+                Y, X = np.mgrid[y_min:y_max, x_min:x_max]
+                off_X = X - curr_x
+                off_Y = Y - curr_y
+
+                Gxx = np.sum(Ix * Ix)
+                Gxy = np.sum(Ix * Iy)
+                Gyy = np.sum(Iy * Iy)
+                
+                bb = Ix * off_X + Iy * off_Y
+                bx = np.sum(bb * Ix)
+                by = np.sum(bb * Iy)
+
+                det = (Gxx * Gyy) - (Gxy * Gxy)
+                if abs(det) < 1e-6: break
+
+                inv_det = 1.0 / det
+                dx = (Gyy * bx - Gxy * by) * inv_det
+                dy = (Gxx * by - Gxy * bx) * inv_det
+
+                bb_x = np.sum(Ix**2 *X + Ix * Iy * Y)
+                bb_y = np.sum(Iy**2 *Y + Ix * Iy * X)
+
+                new_x = (Gyy * bb_x - Gxy * bb_y) * inv_det
+                new_y = (Gxx * bb_y - Gxy * bb_x) * inv_det
+
+                dist = (new_x - curr_x)**2 + (new_y - curr_y)**2
+                curr_x, curr_y = new_x, new_y
+                if dist < epsilon**2:
+                    break
+            results.append([curr_x, curr_y])
+        return np.array(results, dtype=np.float32).reshape(-1, 1, 2)
+
+    @staticmethod
     def findCornersQuadrilateral(contour: np.ndarray) -> np.ndarray:
-        """
-        Finds the 4 corners of a quadrilateral using Radial Distance Peak Detection.
-        More stable than approxPolyDP for AR tags.
-        """
-        # 1. Standardize Input
         if contour.ndim == 3:
             pts = contour.reshape(-1, 2)
         else:
@@ -185,49 +281,32 @@ class CustomCV2:
         if len(pts) < 4:
             return pts.reshape(-1, 1, 2)
 
-        # 2. Centroid Calculation (Fast Mean)
-        # We use the geometric center of the contour points
         centroid = np.mean(pts, axis=0)
 
-        # 3. Distance Signal
-        # Compute squared Euclidean distance from center to every boundary point
         diff = pts - centroid
         dists_sq = np.sum(diff**2, axis=1)
 
-        # 4. Signal Smoothing
-        # Apply a small convolution to remove pixel noise (jagged edges)
-        # which creates fake local peaks.
         kernel_size = 5
-        # Wrap padding handles the closed loop structure
         dists_padded = np.pad(dists_sq, (kernel_size//2, kernel_size//2), mode='wrap')
         dists_smooth = np.convolve(dists_padded, np.ones(kernel_size)/kernel_size, mode='valid')
 
-        # 5. Peak Detection (Vectorized)
-        # A point is a peak if it is further than its neighbors
         prev_pts = np.roll(dists_smooth, 1)
         next_pts = np.roll(dists_smooth, -1)
         
-        # Local Maxima mask
         peaks_mask = (dists_smooth > prev_pts) & (dists_smooth > next_pts)
         peak_indices = np.where(peaks_mask)[0]
 
-        # 6. Filter & Fallback
         if len(peak_indices) > 4:
-            # If noise created extra peaks, pick the 4 farthest from center
             peak_dists = dists_smooth[peak_indices]
-            # argsort is ascending, so we take the last 4
             top_indices = np.argsort(peak_dists)[-4:]
             final_indices = peak_indices[top_indices]
         elif len(peak_indices) < 4:
-            # Fallback to simple bounding box if shape is too distorted
-            # (Rare for valid AR tags)
             return CustomCV2.approxPolyDP(contour, 0.02 * CustomCV2.arcLength(contour, True), True)
         else:
             final_indices = peak_indices
 
         corners = pts[final_indices]
         
-        # Return in (4, 1, 2) format to match OpenCV standards
         return corners.reshape(-1, 1, 2).astype(np.int32)
 
     @staticmethod
