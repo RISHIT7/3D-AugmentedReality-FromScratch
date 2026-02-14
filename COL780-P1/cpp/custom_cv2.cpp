@@ -872,6 +872,65 @@ py::array_t<float> cornerSubPix_cpp(const py::array_t<uint8_t> image, py::array_
     return result;
 }
 
+py::array_t<uint8_t> overlay_image_cpp(py::array_t<uint8_t> frame, py::array_t<uint8_t> overlay, py::array_t<double> H_inv) {
+    auto buf_frame = frame.request();
+    auto buf_overlay = overlay.request();
+
+    int f_h = buf_frame.shape[0];
+    int f_w = buf_frame.shape[1];
+    int f_c = buf_frame.shape[2];
+
+    int o_h = buf_overlay.shape[0];
+    int o_w = buf_overlay.shape[1];
+    int o_c = buf_overlay.shape[2];
+
+    uint8_t* raw_frame = (uint8_t*)buf_frame.ptr;
+    const uint8_t* raw_overlay = (uint8_t*)buf_overlay.ptr;
+
+    auto r_H = H_inv.unchecked<2>();
+    double h00 = r_H(0, 0), h01 = r_H(0, 1), h02 = r_H(0, 2);
+    double h10 = r_H(1, 0), h11 = r_H(1, 1), h12 = r_H(1, 2);
+    double h20 = r_H(2, 0), h21 = r_H(2, 1), h22 = r_H(2, 2);
+
+    #pragma omp parallel for collapse(2)
+    for (int y = 0; y < f_h; y++) {
+        for (int x = 0; x < f_w; x++) {
+            double w = h20 * x + h21 * y + h22;
+            if (std::abs(w) < 1e-5) continue;
+
+            double inv_w = 1.0 / w;
+            double u = (h00 * x + h01 * y + h02) * inv_w;
+            double v = (h10 * x + h11 * y + h12) * inv_w;
+
+            if (u >= 0 && u < o_w - 1 && v >= 0 && v < o_h - 1) {
+                int overlay_x = static_cast<int>(u);
+                int overlay_y = static_cast<int>(v);
+                float dx = u - overlay_x;
+                float dy = v - overlay_y;
+
+                int f_idx = (y * f_w + x) * f_c;
+
+                for (int k = 0; k < 3; k++) {
+                    int o_idx00 = (overlay_y * o_w + overlay_x) * o_c + k;
+                    int o_idx01 = (overlay_y * o_w + overlay_x + 1) * o_c + k;
+                    int o_idx10 = ((overlay_y + 1) * o_w + overlay_x) * o_c + k;
+                    int o_idx11 = ((overlay_y + 1) * o_w + overlay_x + 1) * o_c + k;
+
+                    float val = (1 - dx) * (1 - dy) * raw_overlay[o_idx00] +
+                                dx * (1 - dy) * raw_overlay[o_idx01] +
+                                (1 - dx) * dy * raw_overlay[o_idx10] +
+                                dx * dy * raw_overlay[o_idx11];
+
+                    if (val > 10) {
+                        raw_frame[f_idx + k] = clip_u8(val);
+                    }
+                }
+            }
+        }
+    }
+    return frame;
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -918,4 +977,8 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
     m.def("cornerSubPix_cpp", &cornerSubPix_cpp,
           py::arg("image"), py::arg("corners"), py::arg("win_w"), py::arg("win_h"), py::arg("max_iter"), py::arg("epsilon"),
           "Refines corner locations to sub-pixel accuracy using the specified window size, maximum iterations, and convergence epsilon.");
+
+    m.def("overlay_image_cpp", &overlay_image_cpp,
+          py::arg("frame"), py::arg("overlay"), py::arg("H_inv"),
+          "Overlays the given image onto the frame using the inverse homography matrix H_inv for perspective transformation.");
 }
