@@ -4,7 +4,7 @@ from typing import Tuple, List, Optional
 import sys
 import os
 
-from torch import det
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     import custom_cv2_cpp # type: ignore
@@ -26,6 +26,10 @@ class CustomCV2:
     THRESH_TEMPORAL_APPROX_OTSU = 16
     RETR_TREE = 3
     CHAIN_APPROX_SIMPLE = 2
+    INTER_NEAREST = 0
+    TERM_CRITERIA_EPS = 2
+    TERM_CRITERIA_MAX_ITER = 1
+    TERM_CRITERIA_COUNT = 1
 
     update_freq: int = 10
     min_pixels: int = 256
@@ -209,67 +213,7 @@ class CustomCV2:
         normalized = (res - min_val) * (255.0 / (max_val - min_val))
         return np.clip(normalized, 0, 255).astype(np.uint8)
     
-    @staticmethod
-    def cornerSubPix(image: np.ndarray, corners: np.ndarray, winSize: Tuple[int, int],
-                     zeroZone: Tuple[int, int], criteria: Tuple[int, int, float]) -> np.ndarray:
-        win_w, win_h = winSize
-        max_iter, epsilon = criteria[1], criteria[2]
-        if CPP_AVAILABLE:
-            c_in = corners.reshape(-1, 1, 2).astype(np.float32)
-            return custom_cv2_cpp.cornerSubPix_cpp(image, c_in, win_w, win_h, max_iter, epsilon)
-        
-        corners = corners.astype(np.float32).copy()
-        if corners.ndim == 3:
-            corners = corners.reshape(-1, 2)
-        
-        h, w = image.shape
-        img = image.astype(np.float32)
-        gx, gy = CustomCV2._manual_gradient_2d(img)
 
-        results = []
-        for (cx, cy) in corners:
-            curr_x, curr_y = cx, cy
-
-            for _ in range(max_iter):
-                x_min = max(0, int(curr_x) - win_w)
-                x_max = min(w, int(curr_x) + win_w + 1)
-                y_min = max(0, int(curr_y) - win_h)
-                y_max = min(h, int(curr_y) + win_h + 1)
-
-                Ix = gx[y_min:y_max, x_min:x_max]
-                Iy = gy[y_min:y_max, x_min:x_max]
-
-                Y, X = np.mgrid[y_min:y_max, x_min:x_max]
-                off_X = X - curr_x
-                off_Y = Y - curr_y
-
-                Gxx = np.sum(Ix * Ix)
-                Gxy = np.sum(Ix * Iy)
-                Gyy = np.sum(Iy * Iy)
-                
-                bb = Ix * off_X + Iy * off_Y
-                bx = np.sum(bb * Ix)
-                by = np.sum(bb * Iy)
-
-                det = (Gxx * Gyy) - (Gxy * Gxy)
-                if abs(det) < 1e-6: break
-
-                inv_det = 1.0 / det
-                dx = (Gyy * bx - Gxy * by) * inv_det
-                dy = (Gxx * by - Gxy * bx) * inv_det
-
-                bb_x = np.sum(Ix**2 *X + Ix * Iy * Y)
-                bb_y = np.sum(Iy**2 *Y + Ix * Iy * X)
-
-                new_x = (Gyy * bb_x - Gxy * bb_y) * inv_det
-                new_y = (Gxx * bb_y - Gxy * bb_x) * inv_det
-
-                dist = (new_x - curr_x)**2 + (new_y - curr_y)**2
-                curr_x, curr_y = new_x, new_y
-                if dist < epsilon**2:
-                    break
-            results.append([curr_x, curr_y])
-        return np.array(results, dtype=np.float32).reshape(-1, 1, 2)
 
     @staticmethod
     def findCornersQuadrilateral(contour: np.ndarray) -> np.ndarray:
@@ -699,19 +643,104 @@ class CustomCV2:
     def cornerSubPix(image: np.ndarray, corners: np.ndarray, winSize: Tuple[int, int],
                      zeroZone: Tuple[int, int], criteria: Tuple[int, int, float]) -> np.ndarray:
         """
-        Refine corner locations to sub-pixel accuracy.
+        Refine corner locations to sub-pixel accuracy using iterative
+        gradient-based optimization (pure Python implementation).
         
-        Args:
-            image: Input grayscale image
-            corners: Initial corner coordinates
-            winSize: Half of search window side length
-            zeroZone: Dead region in the middle of search zone
-            criteria: Termination criteria
-            
-        Returns:
-            Refined corners
+        The algorithm solves for the sub-pixel corner position q such that
+        for every pixel p_i in the window: (p_i - q) . G(p_i) = 0,
+        where G(p_i) is the image gradient at p_i.
+        
+        This forms a linear system: A * q = b, solved via least squares.
         """
-        raise NotImplementedError("cornerSubPix needs implementation")
+        
+        # Parse termination criteria
+        crit_type, max_iter, epsilon = criteria
+        if not (crit_type & CustomCV2.TERM_CRITERIA_MAX_ITER):
+            max_iter = 100
+        if not (crit_type & CustomCV2.TERM_CRITERIA_EPS):
+            epsilon = 1e-6
+        
+        if CPP_AVAILABLE:
+            orig_shape = corners.shape
+            c3d = corners.reshape(-1, 1, 2).astype(np.float32)
+            result = custom_cv2_cpp.cornerSubPix_cpp(image, c3d, winSize[0], winSize[1], max_iter, epsilon)
+            return result.reshape(orig_shape)
+
+        img = image.astype(np.float64)
+        h, w = img.shape[:2]
+        win_w, win_h = winSize
+        zero_w, zero_h = zeroZone
+        
+        # Compute image gradients (Sobel-like, central differences)
+        # Pad to avoid boundary issues
+        padded = np.pad(img, 1, mode='reflect')
+        gx = (padded[1:-1, 2:] - padded[1:-1, :-2]) * 0.5
+        gy = (padded[2:, 1:-1] - padded[:-2, 1:-1]) * 0.5
+        
+        refined = corners.copy().astype(np.float32)
+        
+        for i in range(len(refined)):
+            cx, cy = float(refined[i, 0]), float(refined[i, 1])
+            
+            for _ in range(max_iter):
+                # Integer center of search window
+                ix, iy = int(round(cx)), int(round(cy))
+                
+                # Window bounds (clipped to image)
+                x0 = max(0, ix - win_w)
+                x1 = min(w - 1, ix + win_w)
+                y0 = max(0, iy - win_h)
+                y1 = min(h - 1, iy + win_h)
+                
+                if x1 <= x0 or y1 <= y0:
+                    break
+                
+                # Build the linear system: A * q = b
+                # For each pixel (px, py) in the window:
+                #   gx_i, gy_i = gradient at (px, py)
+                #   A += [[gx_i^2, gx_i*gy_i], [gx_i*gy_i, gy_i^2]]
+                #   b += [gx_i^2*px + gx_i*gy_i*py, gx_i*gy_i*px + gy_i^2*py]
+                
+                A = np.zeros((2, 2), dtype=np.float64)
+                b_vec = np.zeros(2, dtype=np.float64)
+                
+                for py in range(y0, y1 + 1):
+                    for px in range(x0, x1 + 1):
+                        # Skip zero zone
+                        if zero_w >= 0 and zero_h >= 0:
+                            if abs(px - ix) <= zero_w and abs(py - iy) <= zero_h:
+                                continue
+                        
+                        dx = gx[py, px]
+                        dy = gy[py, px]
+                        
+                        A[0, 0] += dx * dx
+                        A[0, 1] += dx * dy
+                        A[1, 0] += dx * dy
+                        A[1, 1] += dy * dy
+                        
+                        b_vec[0] += dx * dx * px + dx * dy * py
+                        b_vec[1] += dx * dy * px + dy * dy * py
+                
+                # Solve A * q = b
+                det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
+                if abs(det) < 1e-10:
+                    break  # Singular, can't refine further
+                
+                new_cx = (A[1, 1] * b_vec[0] - A[0, 1] * b_vec[1]) / det
+                new_cy = (A[0, 0] * b_vec[1] - A[1, 0] * b_vec[0]) / det
+                
+                # Check convergence
+                shift = np.sqrt((new_cx - cx) ** 2 + (new_cy - cy) ** 2)
+                cx, cy = new_cx, new_cy
+                
+                if shift < epsilon:
+                    break
+            
+            refined[i, 0] = cx
+            refined[i, 1] = cy
+        
+        return refined
     
     @staticmethod
     def resize(src: np.ndarray, dsize: Tuple[int, int], interpolation: int) -> np.ndarray:
@@ -831,3 +860,81 @@ class CustomCV2:
             return res
         else:
             raise NotImplementedError("Only NORM_MINMAX is implemented in normalize")
+
+    @staticmethod
+    def erode(src: np.ndarray, kernel: np.ndarray, iterations: int = 1) -> np.ndarray:
+        """Erode a grayscale image using a binary structuring element."""
+        if CPP_AVAILABLE:
+            try:
+                return custom_cv2_cpp.erode_cpp(src.astype(np.uint8), kernel.astype(np.uint8), iterations)
+            except Exception:
+                pass
+
+        result = src.copy()
+        kh, kw = kernel.shape[:2]
+        pad_h, pad_w = kh // 2, kw // 2
+        ky, kx = np.where(kernel > 0)
+
+        for _ in range(iterations):
+            padded = np.pad(result, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge')
+            h, w = result.shape[:2]
+            out = np.full_like(result, 255)
+            for dy, dx in zip(ky, kx):
+                shifted = padded[dy:dy + h, dx:dx + w]
+                out = np.minimum(out, shifted)
+            result = out
+
+        return result
+
+    @staticmethod
+    def bitwise_or(src1: np.ndarray, src2: np.ndarray) -> np.ndarray:
+        """Element-wise bitwise OR of two arrays."""
+        if CPP_AVAILABLE:
+            try:
+                return custom_cv2_cpp.bitwise_or_cpp(src1.astype(np.uint8), src2.astype(np.uint8))
+            except Exception:
+                pass
+        return np.bitwise_or(src1, src2)
+
+    @staticmethod
+    def fillConvexPoly(img: np.ndarray, points: np.ndarray, color) -> np.ndarray:
+        """Fill a convex polygon using scanline rasterization (in-place)."""
+        if CPP_AVAILABLE:
+            try:
+                if isinstance(color, (list, tuple)):
+                    color = list(color)
+                else:
+                    color = [int(color)] * 3
+                return custom_cv2_cpp.fillConvexPoly_cpp(img, points.astype(np.int32), color)
+            except Exception:
+                pass
+
+        pts = points.reshape(-1, 2).astype(np.int32)
+        h, w = img.shape[:2]
+        n = len(pts)
+        if n < 3:
+            return img
+
+        y_min = max(0, int(pts[:, 1].min()))
+        y_max = min(h - 1, int(pts[:, 1].max()))
+
+        for y in range(y_min, y_max + 1):
+            x_intersections = []
+            for i in range(n):
+                j = (i + 1) % n
+                y0, y1 = pts[i, 1], pts[j, 1]
+                if y0 == y1:
+                    continue
+                if min(y0, y1) <= y < max(y0, y1):
+                    x = pts[i, 0] + (y - y0) * (pts[j, 0] - pts[i, 0]) / (y1 - y0)
+                    x_intersections.append(x)
+            if len(x_intersections) >= 2:
+                x_intersections.sort()
+                x_start = max(0, int(np.ceil(x_intersections[0])))
+                x_end = min(w - 1, int(np.floor(x_intersections[-1])))
+                if x_start <= x_end:
+                    if img.ndim == 3:
+                        img[y, x_start:x_end + 1] = color
+                    else:
+                        img[y, x_start:x_end + 1] = color[0] if isinstance(color, (list, tuple)) else color
+        return img

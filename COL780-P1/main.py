@@ -37,10 +37,24 @@ def main():
     camera_matrix = None
     if args.calibration:
         try:
-            camera_matrix = np.load(args.calibration)
+            if args.calibration.endswith('.npy'):
+                camera_matrix = np.load(args.calibration)
+            else:
+                camera_matrix = np.load(args.calibration)['camera_matrix']
             print(f"✓ Loaded camera calibration: {args.calibration}")
         except Exception as e:
             print(f"⚠ Warning: Could not load calibration: {e}")
+    elif args.model:
+        # Auto-load professor's calibration for 3D rendering
+        import os
+        calib_paths = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "calibration_prof.npy"),
+        ]
+        for path in calib_paths:
+            if os.path.exists(path):
+                camera_matrix = np.load(path)
+                print(f"✓ Auto-loaded calibration: {path}")
+                break
 
     if not cap.isOpened():
         print(f"Error opening source: {video_source}")

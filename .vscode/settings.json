@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/Users/rishit/miniconda3/bin/python",
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "python.analysis.extraPaths": [
+        "./COL780-P1"
+    ]
+}

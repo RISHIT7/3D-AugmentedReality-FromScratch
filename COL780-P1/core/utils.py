@@ -355,7 +355,7 @@ def render(img, obj, projection, tag_corners, tag_size=2.0, color=(100, 100, 100
                 np.all(face_points[:, 1] < -2000) or np.all(face_points[:, 1] > h + 2000)):
                 continue
             
-            cv2.fillConvexPoly(img, face_points, color)
+            CustomCV2.fillConvexPoly(img, face_points, color)
         except Exception:
             continue
     
@@ -430,7 +430,7 @@ def render_with_lighting(img, obj, projection, camera_matrix, tag_size=2.0,
         shade_factor = max(0.5, min(1.0, 1.0 - (depth - 200) / 1000))
         face_color = tuple(int(c * shade_factor) for c in base_color)
         
-        cv2.fillConvexPoly(img, face_points, face_color)
+        CustomCV2.fillConvexPoly(img, face_points, face_color)
     
     return img
 
@@ -628,6 +628,14 @@ def check_border(processed, cell, margin):
     return True
 
 
+ERROR_CODE = {
+    "INVALID_BORDER": -1,
+    "INVALID_SIZE": -2,
+    "INVALID_CHECKSUM": -3,
+    "INVALID_ORIENTATION": -4,
+    "SUCCESS": 0,
+}
+
 def decode_tag(warped_tag: np.ndarray):
     """
     Decode AR tag from warped image.
@@ -638,29 +646,20 @@ def decode_tag(warped_tag: np.ndarray):
     Returns:
         (tag_id, orientation) or (None, None) if invalid
     """
-    # Enhance and threshold
     sharpened = CustomCV2.sharpenAndNormalize(warped_tag)
     threshold = CustomCV2.threshold(sharpened, 0, 255, CustomCV2.THRESH_BINARY + CustomCV2.THRESH_OTSU)[1]
-    
-    if CPP_AVAILABLE:
-        res_tag_id, res_orientation = custom_cv2_cpp.decode_tag_cpp(threshold)
-        return res_tag_id, res_orientation
-    
     side = threshold.shape[0]
     
-    # Validate minimum size
     if side < 64:
-        return None, None
+        return None, None, ERROR_CODE["INVALID_SIZE"]
     
     cell = side / TAG_GRID_SIZE
     margin = max(1, int(cell / 2))
     margin = min(margin, side // 4)
     
-    # Check border validity
     if not check_border(threshold, cell, margin):
-        return None, None
+        return None, None, ERROR_CODE["INVALID_BORDER"]
     
-    # Sample the 4x4 inner grid
     core_indices = [2, 3, 4, 5]
     
     def get_center_coord(idx):
@@ -672,59 +671,84 @@ def decode_tag(warped_tag: np.ndarray):
     for r_idx, grid_row in enumerate(core_indices):
         y = get_center_coord(grid_row)
         row_signal = threshold[y, :]
-        
-        # Smooth the signal
         row_signal = CustomCV2.GaussianBlur(
-            row_signal.reshape(-1, 1).astype(float), (5, 1), 16
+            row_signal.reshape(-1, 1).astype(np.float64), (5, 1), 16
         ).flatten()
         
         col_coords = [get_center_coord(c_idx) for c_idx in core_indices]
         row_values = [row_signal[c] for c in col_coords]
         
-        # Adaptive thresholding for this row
-        data_start_x = int(2 * cell)
-        data_end_x = int(6 * cell)
-        segment = row_signal[data_start_x:data_end_x]
-        local_min = np.min(segment)
-        local_max = np.max(segment)
-        row_thresh = (local_min + local_max) / 2
+        segment = row_signal[int(2*cell):int(6*cell)].astype(np.float64)
+        local_min, local_max = float(np.min(segment)), float(np.max(segment))
+        row_thresh = (local_min + local_max) / 2.0
         
         if (local_max - local_min) < 30:
-            row_thresh = 155
+            row_thresh = 155.0
         
         for c_idx, val in enumerate(row_values):
             grid_intensities[r_idx, c_idx] = val
             grid_bits[r_idx, c_idx] = 1 if val > row_thresh else 0
     
-    # Determine orientation from white corner marker
-    anchors_vals = [
-        grid_intensities[3, 3],  # Bottom-right
-        grid_intensities[3, 0],  # Bottom-left
-        grid_intensities[0, 0],  # Top-left
-        grid_intensities[0, 3]   # Top-right
+    # Orientation detection via erosion + grayscale fallback
+    anchor_positions = [
+        (get_center_coord(5), get_center_coord(5)),  # BR
+        (get_center_coord(5), get_center_coord(2)),  # BL
+        (get_center_coord(2), get_center_coord(2)),  # TL
+        (get_center_coord(2), get_center_coord(5)),  # TR
     ]
-    orientation = int(np.argmax(anchors_vals))
     
-    if anchors_vals[orientation] < 127:
-        return None, None
+    erode_k = max(3, int(cell * 0.15)) | 1  # ensure odd
+    erode_kernel = np.ones((erode_k, erode_k), dtype=np.uint8)
+    threshold_eroded = CustomCV2.erode(threshold, erode_kernel, iterations=2)
+    
+    patch_half = max(2, int(cell * 0.2))
+    
+    def sample_patch_median(img, cy, cx):
+        h, w = img.shape[:2]
+        y0 = max(0, cy - patch_half)
+        y1 = min(h, cy + patch_half + 1)
+        x0 = max(0, cx - patch_half)
+        x1 = min(w, cx + patch_half + 1)
+        return float(np.median(img[y0:y1, x0:x1].astype(np.float64)))
+    
+    eroded_vals = [sample_patch_median(threshold_eroded, *pos) for pos in anchor_positions]
+    
+    white_corners = [i for i, v in enumerate(eroded_vals) if v > 127]
+    
+    if len(white_corners) == 1:
+        orientation = white_corners[0]
+    else:
+        # Fallback: use grayscale brightness to pick brightest anchor
+        gs_vals = [sample_patch_median(sharpened, *pos) for pos in anchor_positions]
+        sorted_indices = np.argsort(gs_vals)
+        max_idx = int(sorted_indices[-1])
+        max_val = gs_vals[max_idx]
+        all_range = max_val - gs_vals[int(sorted_indices[0])]
+        
+        if max_val < 100.0 and all_range < 15.0:
+            return None, None, ERROR_CODE["INVALID_ORIENTATION"]
+        
+        if len(white_corners) >= 2:
+            orientation = max(white_corners, key=lambda i: gs_vals[i])
+        else:
+            orientation = max_idx
     
     # Decode data bits based on orientation
     bit_map = {
-        0: [(1, 1), (1, 2), (2, 2), (2, 1)],  # Bottom-right is white
-        1: [(1, 2), (2, 2), (2, 1), (1, 1)],  # Bottom-left is white
-        2: [(2, 2), (2, 1), (1, 1), (1, 2)],  # Top-left is white
-        3: [(2, 1), (1, 1), (1, 2), (2, 2)]   # Top-right is white
+        0: [(1, 1), (1, 2), (2, 2), (2, 1)],
+        1: [(1, 2), (2, 2), (2, 1), (1, 1)],
+        2: [(2, 2), (2, 1), (1, 1), (1, 2)],
+        3: [(2, 1), (1, 1), (1, 2), (2, 2)]
     }
     
     try:
         data_bits = [grid_bits[r, c] for r, c in bit_map[orientation]]
     except KeyError:
-        return None, None
+        return None, None, ERROR_CODE["INVALID_ORIENTATION"]
     
-    # Convert bits to tag ID (clockwise pattern)
     tag_id = (data_bits[0] << 0) | (data_bits[1] << 1) | (data_bits[2] << 2) | (data_bits[3] << 3)
     
-    return tag_id, orientation
+    return tag_id, orientation, ERROR_CODE["SUCCESS"]
 
 
 def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
@@ -749,14 +773,57 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
                 if np.any(dists < CENTER_PROXIMITY_THRESH_SQUARED): continue
             
             rect = order_points(quad)
+            rect = refine_corners(gray, rect)
             H = CustomCV2.getPerspectiveTransform(rect, WARP_DST)
             warped = CustomCV2.warpPerspective(gray, H, (SIDE, SIDE))
             
-            tag_id, orientation = decode_tag(warped)
+            tag_id, orientation, error_code = decode_tag(warped)
+            
+            if error_code == ERROR_CODE["INVALID_BORDER"]:
+                # 2-layer decoding: re-threshold warped region to find inner tag
+                inner_thresh = CustomCV2.adaptiveThreshold(
+                    warped, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C,
+                    CustomCV2.THRESH_BINARY_INV, 11, 7
+                )
+                inner_contours, _ = CustomCV2.findContours(
+                    inner_thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE
+                )
+                inner_min_area = SIDE * SIDE * 0.05
+                inner_max_area = SIDE * SIDE * 0.85
+                for ic in inner_contours:
+                    ia = CustomCV2.contourArea(ic)
+                    if ia < inner_min_area or ia > inner_max_area:
+                        continue
+                    ip = CustomCV2.arcLength(ic, True)
+                    iq = CustomCV2.approxPolyDP(ic, 0.02 * ip, True)
+                    if len(iq) == 4 and CustomCV2.isContourConvex(iq):
+                        inner_rect = order_points(iq)
+                        # Map inner corners back to original image space
+                        pts_h = np.hstack([inner_rect, np.ones((4, 1), dtype=np.float64)])
+                        try:
+                            H_inv = np.linalg.inv(H)
+                        except np.linalg.LinAlgError:
+                            continue
+                        mapped = (H_inv @ pts_h.T).T
+                        mapped_pts = (mapped[:, :2] / mapped[:, 2:3]).astype(np.float32)
+                        
+                        mapped_pts = refine_corners(gray, mapped_pts)
+                        H2 = CustomCV2.getPerspectiveTransform(mapped_pts, WARP_DST)
+                        warped2 = CustomCV2.warpPerspective(gray, H2, (SIDE, SIDE))
+                        
+                        tag_id, orientation, error_code = decode_tag(warped2)
+                        if tag_id is not None:
+                            rect = np.roll(mapped_pts, -orientation, axis=0)
+                            processed_centers.append((cX, cY))
+                            candidates.append({"id": tag_id, "corners": rect, "orientation": orientation * 90})
+                            break  # found inner tag, stop searching
+                continue  # skip the normal path for this contour
+            
             if tag_id is not None:
                 rect = np.roll(rect, -orientation, axis=0)
                 processed_centers.append((cX, cY))
                 candidates.append({"id": tag_id, "corners": rect, "orientation": orientation * 90})
+
     return candidates
 
 
@@ -766,8 +833,14 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
     
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
     blurred = CustomCV2.bilateralFilter(gray, 9, 75, 75)
-    thresh = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, 11, 7)
     
+    # Multi-scale adaptive thresholding — captures tags at different distances
+    block_sizes = [8, 11, 21]
+    thresh = np.zeros_like(gray)
+    for bs in block_sizes:
+        t = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, bs, 7)
+        thresh = CustomCV2.bitwise_or(thresh, t)
+
     detected_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
     
     if camera_matrix is None:
@@ -808,46 +881,34 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
             
             # Check H_3d validity
             if H_3d is not None and np.all(np.isfinite(H_3d)) and np.linalg.det(H_3d) != 0:
-                # Get projection matrix
-                projection = get_projection_matrix(camera_matrix.astype(np.float64), H_3d)
+                # get_projection_matrix returns [R|t], need K @ [R|t] for full projection
+                Rt = get_projection_matrix(camera_matrix.astype(np.float64), H_3d)
                 
-                if projection is not None and np.all(np.isfinite(projection)):
-                    projection_full = np.dot(camera_matrix.astype(np.float64), projection)
+                if Rt is not None and np.all(np.isfinite(Rt)):
+                    projection = np.dot(camera_matrix.astype(np.float64), Rt)
                     
-                    # Render with safety checks
-                    frame = render(frame, obj_model, projection_full, smoothed_corners, 
+                    frame = render(frame, obj_model, projection, smoothed_corners, 
                                   tag_size=half_size * 2, color=(80, 80, 80), scale=2.5)
-
-        cv2.polylines(frame, [np.int32(smoothed_corners)], True, (0, 255, 0), 2)
-        cv2.putText(frame, f"ID: {tag_id}", tuple(np.int32(smoothed_corners[0])), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(frame, f"Angle: {tag['angle']:.1f}deg", 
-                   tuple(np.int32(smoothed_corners[1]) + np.array([0, 30])), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
+        
+        if obj_model is None and template_img is None:  
+            cv2.polylines(frame, [np.int32(smoothed_corners)], True, (0, 255, 0), 2)
+            cv2.putText(frame, f"ID: {tag_id}", tuple(np.int32(smoothed_corners[0])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(frame, f"Angle: {tag['angle']:.1f}deg", 
+                    tuple(np.int32(smoothed_corners[1]) + np.array([0, 30])), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
     
     return frame, detected_tags
 
 
 def overlay_image_python(frame, overlay, H):
-    """
-    Python fallback for image overlay (slower than C++ version).
-    
-    Args:
-        frame: Background image
-        overlay: Image to overlay
-        H: Homography matrix from overlay to frame
-        
-    Returns:
-        Frame with overlay applied
-    """
+    """Python fallback for image overlay (slower than C++ version)."""
     h_frame, w_frame = frame.shape[:2]
     h_overlay, w_overlay = overlay.shape[:2]
     
-    # Create mesh of frame coordinates
     y_coords, x_coords = np.mgrid[0:h_frame, 0:w_frame]
     coords = np.stack([x_coords.flatten(), y_coords.flatten(), np.ones(h_frame * w_frame)])
     
-    # Inverse map to overlay coordinates
     H_inv = np.linalg.inv(H)
     overlay_coords = H_inv @ coords
     overlay_coords /= overlay_coords[2]
@@ -855,13 +916,11 @@ def overlay_image_python(frame, overlay, H):
     overlay_x = overlay_coords[0].reshape(h_frame, w_frame)
     overlay_y = overlay_coords[1].reshape(h_frame, w_frame)
     
-    # Check which pixels map to valid overlay coordinates
     valid_mask = (
         (overlay_x >= 0) & (overlay_x < w_overlay - 1) &
         (overlay_y >= 0) & (overlay_y < h_overlay - 1)
     )
     
-    # Bilinear interpolation for valid pixels
     x0 = np.floor(overlay_x[valid_mask]).astype(int)
     y0 = np.floor(overlay_y[valid_mask]).astype(int)
     x1 = np.clip(x0 + 1, 0, w_overlay - 1)
@@ -870,6 +929,7 @@ def overlay_image_python(frame, overlay, H):
     dx = overlay_x[valid_mask] - x0
     dy = overlay_y[valid_mask] - y0
     
+    y_valid, x_valid = np.where(valid_mask)
     for c in range(3):
         vals = (
             overlay[y0, x0, c] * (1 - dx) * (1 - dy) +
@@ -877,9 +937,6 @@ def overlay_image_python(frame, overlay, H):
             overlay[y1, x0, c] * (1 - dx) * dy +
             overlay[y1, x1, c] * dx * dy
         )
-        frame_copy = frame.copy()
-        y_valid, x_valid = np.where(valid_mask)
-        frame_copy[y_valid, x_valid, c] = vals.astype(np.uint8)
-        frame = frame_copy
+        frame[y_valid, x_valid, c] = vals.astype(np.uint8)
     
     return frame
