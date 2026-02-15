@@ -2,7 +2,7 @@ import cv2
 import argparse
 import numpy as np
 from core.utils import *
-import core.calibration
+import core.calibration as calibration
 
 def parser_tasks(args):
     video_source = args.video if args.video else 0
@@ -37,11 +37,11 @@ def parser_tasks(args):
     return cap, template_img, obj_model, camera_matrix
 
 def calibrator(args):
-    if not args.calibration_source:
+    if not args.calibrate_source:
         print("Error: --calibration_source is required for calibration mode.")
         return
     
-    calibration.calibrate(args.calibration_source, tuple(args.grid_size), args.out)
+    calibration.calibrate(args.calibrate_source, tuple(args.grid_size), args.out)
     return
 
 def main():

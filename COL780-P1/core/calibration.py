@@ -59,7 +59,7 @@ def calibrate(source, grid_size, out_path):
     ret, mtx, dist, _, _ = cv2.calibrateCamera(objpoints, imgpoints, img_size, None, None)
     
     if ret:
-        np.save(out_path, {'camera_matrix': mtx, 'dist_coeffs': dist})
+        np.save(out_path, mtx)
         
         mean_error = 0
         for i in range(len(objpoints)):
