@@ -2,8 +2,6 @@
 assets/*
 .DS_Store
 *.obj
-*.png
-*.jpg
 *.mp4
 *.pyc
 __pycache__/
