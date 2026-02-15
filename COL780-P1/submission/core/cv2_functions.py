@@ -833,6 +833,15 @@ class CustomCV2:
         return np.bitwise_or(src1, src2)
 
     @staticmethod
+    def bitwise_and(src1: np.ndarray, src2: np.ndarray) -> np.ndarray:
+        if CPP_AVAILABLE:
+            try:
+                return custom_cv2_cpp.bitwise_and_cpp(src1.astype(np.uint8), src2.astype(np.uint8))
+            except Exception:
+                pass
+        return np.bitwise_and(src1, src2)
+
+    @staticmethod
     def fillConvexPoly(img: np.ndarray, points: np.ndarray, color) -> np.ndarray:
         if CPP_AVAILABLE:
             try:
@@ -873,3 +882,90 @@ class CustomCV2:
                     else:
                         img[y, x_start:x_end + 1] = color[0] if isinstance(color, (list, tuple)) else color
         return img
+
+    @staticmethod
+    def Rodrigues(src):
+        src = np.asarray(src, dtype=np.float64)
+        if src.shape == (3, 3):
+            R = src
+            cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+            theta = np.arccos(cos_theta)
+            if theta < 1e-6:
+                return np.zeros((3, 1), dtype=np.float64), None
+            if abs(theta - np.pi) < 1e-6:
+                S = (R - np.eye(3)) / 2.0
+                ssq = np.array([S[0, 0] + 1, S[1, 1] + 1, S[2, 2] + 1])
+                ssq = np.clip(ssq, 0, None)
+                k = np.sqrt(ssq)
+                if k[0] > 1e-6:
+                    if S[0, 1] < 0: k[1] = -k[1]
+                    if S[0, 2] < 0: k[2] = -k[2]
+                elif k[1] > 1e-6:
+                    if S[1, 2] < 0: k[2] = -k[2]
+                return (k * theta).reshape(3, 1), None
+            v = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+            rvec = (theta / (2.0 * np.sin(theta))) * v
+            return rvec.reshape(3, 1), None
+        else:
+            rvec = src.flatten()[:3]
+            theta = np.linalg.norm(rvec)
+            if theta < 1e-6:
+                return np.eye(3, dtype=np.float64), None
+            k = rvec / theta
+            K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]], dtype=np.float64)
+            R = np.cos(theta) * np.eye(3) + (1 - np.cos(theta)) * np.outer(k, k) + np.sin(theta) * K
+            return R, None
+
+    @staticmethod
+    def solvePnP(objectPoints, imagePoints, cameraMatrix, distCoeffs, flags=0):
+        if CPP_AVAILABLE:
+            try:
+                obj = np.ascontiguousarray(objectPoints, dtype=np.float64)
+                img = np.ascontiguousarray(imagePoints, dtype=np.float64)
+                cam = np.ascontiguousarray(cameraMatrix, dtype=np.float64)
+                success, rvec, tvec = custom_cv2_cpp.solvePnP_cpp(obj, img, cam)
+                return success, rvec, tvec
+            except Exception:
+                pass
+
+        obj = np.asarray(objectPoints, dtype=np.float64)
+        img = np.asarray(imagePoints, dtype=np.float64).reshape(-1, 2)
+        K = np.asarray(cameraMatrix, dtype=np.float64)
+
+        obj_2d = obj[:, :2].astype(np.float32)
+        img_f = img.astype(np.float32)
+
+        H = CustomCV2.getPerspectiveTransform(obj_2d, img_f)
+        if H is None:
+            return False, None, None
+
+        H = H.astype(np.float64)
+        K_inv = np.linalg.inv(K)
+        M = K_inv @ H
+
+        h1, h2, h3 = M[:, 0], M[:, 1], M[:, 2]
+        lam = 1.0 / np.linalg.norm(h1)
+
+        if h3[2] * lam < 0:
+            lam = -lam
+
+        r1 = lam * h1
+        r2 = lam * h2
+        t = lam * h3
+
+        r3 = np.cross(r1, r2)
+        r2 = np.cross(r3, r1)
+
+        r1 /= np.linalg.norm(r1)
+        r2 /= np.linalg.norm(r2)
+        r3 /= np.linalg.norm(r3)
+
+        R = np.column_stack([r1, r2, r3])
+
+        if np.linalg.det(R) < 0:
+            R = -R
+            t = -t
+
+        rvec, _ = CustomCV2.Rodrigues(R)
+        tvec = t.reshape(3, 1)
+        return True, rvec, tvec

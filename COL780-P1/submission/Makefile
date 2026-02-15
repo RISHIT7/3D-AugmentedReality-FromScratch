@@ -1,4 +1,4 @@
-ifeq ($(OS), Windows_NT)
+ifeq ($(OS),Windows_NT)
     RM = del /Q /F
     EXT = *.pyd
 else
@@ -9,16 +9,16 @@ endif
 all: build
 
 install:
-    pip install -r requirements.txt
+	pip install -r requirements.txt
 
 build:
-    python setup.py build_ext --inplace
+	python setup.py build_ext --inplace
 
 run: build
-    python main.py
+	python main.py
 
 clean:
-    $(RM) build
-    $(RM) $(EXT)
+	$(RM) build
+	$(RM) $(EXT)
 
 .PHONY: all install build run clean

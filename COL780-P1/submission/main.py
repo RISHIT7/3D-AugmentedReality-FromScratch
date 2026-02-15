@@ -2,7 +2,7 @@ import cv2
 import argparse
 import numpy as np
 from core.utils import *
-import calibration
+import core.calibration as calibration
 
 def parser_tasks(args):
     video_source = args.video if args.video else 0
@@ -13,7 +13,7 @@ def parser_tasks(args):
     obj_model = None
     if args.model:
         try:
-            obj_model = OBJ(args.model, swapyz=True)
+            obj_model = OBJ(args.model, swapyz=True, swapxy=True, swapxz=False)
         except Exception as e:
             print(f"Could not load 3D model: {e}")
     
@@ -37,11 +37,11 @@ def parser_tasks(args):
     return cap, template_img, obj_model, camera_matrix
 
 def calibrator(args):
-    if not args.calibration_source:
+    if not args.calibrate_source:
         print("Error: --calibration_source is required for calibration mode.")
         return
     
-    calibration.calibrate(args.calibration_source, tuple(args.grid_size), args.out)
+    calibration.calibrate(args.calibrate_source, tuple(args.grid_size), args.out)
     return
 
 def main():
@@ -55,7 +55,7 @@ def main():
                         default='5deg', help="Angle measurement granularity (default: 5deg)")
     
     parser.add_argument("--calibrate", action="store_true", help="Calibrate camera")
-    parser.add_argument("--calibrate_source", type=str, help="Source for calibration (video/images)", required=True)
+    parser.add_argument("--calibrate_source", type=str, help="Source for calibration (video/images)", required=False)
     parser.add_argument("--grid_size", type=int, nargs=2, default=[8, 11], help="Grid size (rows, cols) for calibration.")
     parser.add_argument("--out", type=str, default="assets/calibration.npy", help="Output path for calibration.")
 
@@ -68,7 +68,7 @@ def main():
         cap, template_img, obj_model, camera_matrix = parser_tasks(args)
     
     print(f"Processing started. Press 'q' to quit, SPACE to pause, 'r' to resume")
-
+    paused = False
     while cap.isOpened():
         if not paused:
             ret, frame = cap.read()

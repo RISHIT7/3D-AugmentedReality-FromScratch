@@ -40,9 +40,9 @@ class OBJ:
                         v = [float(values[1]), float(values[2]), float(values[3])]
                         if swapyz:
                             v = [v[0], v[2], v[1]]
-                        elif swapxy:
+                        if swapxy:
                             v = [v[1], v[0], v[2]]
-                        elif swapxz:
+                        if swapxz:
                             v = [v[2], v[1], v[0]]
                         self.vertices.append(v)
                     elif values[0] == 'f':
@@ -57,23 +57,22 @@ class OBJ:
         except Exception as e:
             print(f"Error loading OBJ: {e}")
 
-def render(img, obj, projection, tag_corners, tag_size=2.0, color=(100, 100, 100), scale=3.0):
-    if obj is None or len(obj.vertices) == 0 or len(obj.faces) == 0:
-        return img
-
+def _normalize_vertices(obj, scale, tag_size):
+    """Normalize OBJ vertices: center, scale to [-1,1], then apply scale and tag_size."""
     vertices_3d = obj.vertices.copy()
-
     min_v = np.min(vertices_3d, axis=0)
     max_v = np.max(vertices_3d, axis=0)
     center = (min_v + max_v) / 2
     size_range = np.max(max_v - min_v)
-
     if size_range == 0:
         size_range = 1.0
-
     vertices_3d = (vertices_3d - center) / size_range
     vertices_3d *= scale * (tag_size / 2.0)
+    return vertices_3d
 
+
+def _project_vertices(vertices_3d, projection):
+    """Project 3D vertices using the projection matrix. Returns (points_2d, w, valid_mask) or None."""
     n = len(vertices_3d)
     vertices_homo = np.column_stack([vertices_3d, np.ones(n)])
 
@@ -82,94 +81,84 @@ def render(img, obj, projection, tag_corners, tag_size=2.0, color=(100, 100, 100
         projected = projection @ vertices_homo.T
 
     if not np.all(np.isfinite(projected)):
-        return img
+        return None
 
     w = projected[2, :]
-
     valid_mask = w > 0.001
     if not np.any(valid_mask):
-        return img
+        return None
 
     with np.errstate(divide='ignore', invalid='ignore'):
         x_2d = projected[0, :] / w
         y_2d = projected[1, :] / w
 
     points_2d = np.column_stack([x_2d, y_2d]).astype(np.int32)
-    h, w_img = img.shape[:2]
+    return points_2d, w, valid_mask
 
+
+def _collect_visible_faces(obj, points_2d, w, valid_mask, img_shape, margin=2000):
+    """Collect faces that pass validity and bounds checks. Returns list of (avg_depth, face_points)."""
+    h, w_img = img_shape[:2]
+    face_data = []
     for face_indices in obj.faces:
         if not all(valid_mask[i] for i in face_indices if i < len(valid_mask)):
             continue
-
         try:
             face_points = points_2d[face_indices]
-
-            if (np.all(face_points[:, 0] < -2000) or np.all(face_points[:, 0] > w_img + 2000) or
-                np.all(face_points[:, 1] < -2000) or np.all(face_points[:, 1] > h + 2000)):
+            if (np.all(face_points[:, 0] < -margin) or np.all(face_points[:, 0] > w_img + margin) or
+                np.all(face_points[:, 1] < -margin) or np.all(face_points[:, 1] > h + margin)):
                 continue
-
-            CustomCV2.fillConvexPoly(img, face_points, color)
+            avg_depth = np.mean(w[face_indices])
+            face_data.append((avg_depth, face_points))
         except Exception:
             continue
+    face_data.sort(reverse=True, key=lambda x: x[0])
+    return face_data
+
+
+def render(img, obj, projection, tag_corners=None, tag_size=2.0, color=(100, 100, 100), scale=3.0):
+    if obj is None or len(obj.vertices) == 0 or len(obj.faces) == 0:
+        return img
+
+    vertices_3d = _normalize_vertices(obj, scale, tag_size)
+    result = _project_vertices(vertices_3d, projection)
+    if result is None:
+        return img
+    points_2d, w, valid_mask = result
+
+    face_data = _collect_visible_faces(obj, points_2d, w, valid_mask, img.shape)
+
+    for _depth, face_points in face_data:
+        CustomCV2.fillConvexPoly(img, face_points, color)
 
     return img
 
-def render_with_lighting(img, obj, projection, camera_matrix, tag_size=2.0, 
-                          base_color=(120, 120, 120), scale=3.0):
-    if len(obj.vertices) == 0 or len(obj.faces) == 0:
+def render_with_lighting(img, obj, projection, tag_corners=None, tag_size=2.0,
+                          color=(120, 120, 120), scale=3.0):
+    if obj is None or len(obj.vertices) == 0 or len(obj.faces) == 0:
         return img
 
-    vertices_3d = obj.vertices.copy() * scale
+    vertices_3d = _normalize_vertices(obj, scale, tag_size)
+    result = _project_vertices(vertices_3d, projection)
+    if result is None:
+        return img
+    points_2d, w, valid_mask = result
 
-    z_min = vertices_3d[:, 2].min()
-    vertices_3d[:, 2] -= z_min
-    x_center = (vertices_3d[:, 0].max() + vertices_3d[:, 0].min()) / 2
-    y_center = (vertices_3d[:, 1].max() + vertices_3d[:, 1].min()) / 2
-    vertices_3d[:, 0] -= x_center
-    vertices_3d[:, 1] -= y_center
+    face_data = _collect_visible_faces(obj, points_2d, w, valid_mask, img.shape)
 
-    n = len(vertices_3d)
-    vertices_homo = np.column_stack([vertices_3d, np.ones(n)])
-
-    projected = projection @ vertices_homo.T
-    w = projected[2, :]
-
-    valid_mask = w > 0.1
-    if not np.any(valid_mask):
+    if not face_data:
         return img
 
-    x_2d = projected[0, :] / w
-    y_2d = projected[1, :] / w
-    points_2d = np.column_stack([x_2d, y_2d]).astype(np.int32)
-
-    h, w_img = img.shape[:2]
-
-    face_data = []
-
-    for face_indices in obj.faces:
-        if not all(valid_mask[i] for i in face_indices if i < len(valid_mask)):
-            continue
-
-        try:
-            face_points = points_2d[face_indices]
-
-            if (np.all(face_points[:, 0] < -500) or np.all(face_points[:, 0] > w_img + 500) or
-                np.all(face_points[:, 1] < -500) or np.all(face_points[:, 1] > h + 500)):
-                continue
-
-            face_depths = w[face_indices]
-            avg_depth = np.mean(face_depths)
-
-            face_data.append((avg_depth, face_points))
-        except:
-            continue
-
-    face_data.sort(reverse=True, key=lambda x: x[0])
+    all_depths = [d for d, _ in face_data]
+    depth_min, depth_max = min(all_depths), max(all_depths)
+    depth_range = depth_max - depth_min
+    if depth_range < 1e-6:
+        depth_range = 1.0
 
     for depth, face_points in face_data:
-        shade_factor = max(0.5, min(1.0, 1.0 - (depth - 200) / 1000))
-        face_color = tuple(int(c * shade_factor) for c in base_color)
-
+        t = (depth - depth_min) / depth_range
+        shade_factor = max(0.5, min(1.0, 1.0 - 0.5 * t))
+        face_color = tuple(int(c * shade_factor) for c in color)
         CustomCV2.fillConvexPoly(img, face_points, face_color)
 
     return img
@@ -220,6 +209,29 @@ def order_points(pts):
 def refine_corners(gray, corners):
     criteria = (CustomCV2.TERM_CRITERIA_EPS + CustomCV2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     return CustomCV2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
+
+def is_valid_quadrilateral(pts, min_side=5.0, max_side_ratio=4.0, min_angle=40.0, max_angle=140.0):
+    """Check if a 4-point polygon is geometrically consistent with a (perspective-warped) square.
+    Rejects elongated parallelograms, extreme trapezoids, and noise artifacts."""
+    pts = pts.reshape(4, 2).astype(np.float64)
+
+    sides = np.array([np.sqrt(np.sum((pts[(i+1) % 4] - pts[i])**2)) for i in range(4)])
+    if np.min(sides) < min_side:
+        return False
+    if np.max(sides) / (np.min(sides) + 1e-8) > max_side_ratio:
+        return False
+
+    for i in range(4):
+        v1 = pts[(i - 1) % 4] - pts[i]
+        v2 = pts[(i + 1) % 4] - pts[i]
+        dot = np.dot(v1, v2)
+        norms = np.sqrt(np.sum(v1**2)) * np.sqrt(np.sum(v2**2)) + 1e-8
+        cos_angle = np.clip(dot / norms, -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        if angle_deg < min_angle or angle_deg > max_angle:
+            return False
+
+    return True
 
 def check_border(processed, cell, margin):
     side = processed.shape[0]
@@ -389,7 +401,7 @@ def decode_tag(warped_tag: np.ndarray):
     return tag_id, orientation, ERROR_CODE["SUCCESS"]
 
 def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
-    contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_LIST, CustomCV2.CHAIN_APPROX_SIMPLE)
+    contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
     candidates = []
     processed_centers = []
 
@@ -401,7 +413,7 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
         peri = CustomCV2.arcLength(cnt, True)
         quad = CustomCV2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        if len(quad) == 4 and CustomCV2.isContourConvex(quad):
+        if len(quad) == 4 and CustomCV2.isContourConvex(quad) and is_valid_quadrilateral(quad):
             M = CustomCV2.moments(cnt)
             if M["m00"] == 0:
                 continue
@@ -453,14 +465,14 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
                         tag_id, orientation, error_code = decode_tag(warped2)
                         if tag_id is not None:
                             rect = np.roll(mapped_pts, -orientation, axis=0)
-                            processed_centers.append((cX, cY))
+                            processed_centers.append((cx, cy))
                             candidates.append({"id": tag_id, "corners": rect, "orientation": orientation * 90})
                             break
                 continue
 
             if tag_id is not None:
                 rect = np.roll(rect, -orientation, axis=0)
-                processed_centers.append((cX, cY))
+                processed_centers.append((cx, cy))
                 candidates.append({"id": tag_id, "corners": rect, "orientation": orientation * 90})
 
     return candidates
@@ -470,15 +482,35 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
     MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9
 
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
-    blurred = CustomCV2.bilateralFilter(gray, 9, 75, 75)
 
-    block_sizes = [8, 11, 21]
-    thresh = np.zeros_like(gray)
-    for bs in block_sizes:
-        t = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, bs, 7)
-        thresh = CustomCV2.bitwise_or(thresh, t)
+    scales = [
+        (8, 5),
+        (21, 11)
+    ]
 
-    detected_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
+    detected_tags = []
+    detected_centers = []
+
+    for block_size, blur_size in scales:
+        blurred = CustomCV2.bilateralFilter(gray, blur_size, 75, 75)
+        thresh = CustomCV2.adaptiveThreshold(
+            blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C,
+            CustomCV2.THRESH_BINARY_INV, block_size, 7
+        )
+
+        scale_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
+
+        for tag in scale_tags:
+            tag_center = np.mean(tag["corners"], axis=0)
+            too_close = False
+            for existing_center in detected_centers:
+                if np.sum((tag_center - existing_center)**2) < CENTER_PROXIMITY_THRESH_SQUARED:
+                    too_close = True
+                    break
+
+            if not too_close:
+                detected_tags.append(tag)
+                detected_centers.append(tag_center)
 
     if camera_matrix is None:
         h, w = frame.shape[:2]
@@ -511,10 +543,10 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
             ], dtype=np.float64)
             
             img_pts = tag["corners"].astype(np.float64)
-            success, rvec, tvec = cv2.solvePnP(obj_pts_3d, img_pts, camera_matrix.astype(np.float64), None, flags=cv2.SOLVEPNP_ITERATIVE)
+            success, rvec, tvec = CustomCV2.solvePnP(obj_pts_3d, img_pts, camera_matrix.astype(np.float64), None)
             
             if success:
-                R, _ = cv2.Rodrigues(rvec)
+                R, _ = CustomCV2.Rodrigues(rvec)
                 Rt = np.column_stack((R, tvec))
                 
                 Rx = np.array([
@@ -542,8 +574,8 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
                      print(f"Warning: tvec Z is very small ({tvec[2]})")
                 
                 if np.all(np.isfinite(projection)):
-                    frame = render(frame, obj_model, projection, tag["corners"], 
-                                    tag_size=half_size * 2, color=(80, 80, 80), scale=2.5)
+                    frame = render_with_lighting(frame, obj_model, projection, tag["corners"],
+                                    tag_size=half_size * 2, color=(250, 0, 0), scale=2.5)
 
         if obj_model is None and template_img is None:  
             cv2.polylines(frame, [np.int32(tag["corners"])], True, (0, 255, 0), 2)

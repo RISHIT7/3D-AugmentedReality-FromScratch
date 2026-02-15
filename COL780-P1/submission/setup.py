@@ -26,7 +26,7 @@ define_macros = []
 if sys.platform == 'win32':
     extra_compile_args += ['/O2', '/openmp', '/std:c++14']
 else:
-    extra_compile_args += ['-O3', '-std=c++14']
+    extra_compile_args += ['-O3', '-std=c++14', '-march=native']
     
     if sys.platform == 'darwin':
         extra_compile_args += ['-Xpreprocessor', '-fopenmp']

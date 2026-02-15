@@ -833,6 +833,15 @@ class CustomCV2:
         return np.bitwise_or(src1, src2)
 
     @staticmethod
+    def bitwise_and(src1: np.ndarray, src2: np.ndarray) -> np.ndarray:
+        if CPP_AVAILABLE:
+            try:
+                return custom_cv2_cpp.bitwise_and_cpp(src1.astype(np.uint8), src2.astype(np.uint8))
+            except Exception:
+                pass
+        return np.bitwise_and(src1, src2)
+
+    @staticmethod
     def fillConvexPoly(img: np.ndarray, points: np.ndarray, color) -> np.ndarray:
         if CPP_AVAILABLE:
             try:
@@ -909,6 +918,16 @@ class CustomCV2:
 
     @staticmethod
     def solvePnP(objectPoints, imagePoints, cameraMatrix, distCoeffs, flags=0):
+        if CPP_AVAILABLE:
+            try:
+                obj = np.ascontiguousarray(objectPoints, dtype=np.float64)
+                img = np.ascontiguousarray(imagePoints, dtype=np.float64)
+                cam = np.ascontiguousarray(cameraMatrix, dtype=np.float64)
+                success, rvec, tvec = custom_cv2_cpp.solvePnP_cpp(obj, img, cam)
+                return success, rvec, tvec
+            except Exception:
+                pass
+
         obj = np.asarray(objectPoints, dtype=np.float64)
         img = np.asarray(imagePoints, dtype=np.float64).reshape(-1, 2)
         K = np.asarray(cameraMatrix, dtype=np.float64)

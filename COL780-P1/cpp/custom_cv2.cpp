@@ -507,8 +507,9 @@ py::array_t<uint8_t> gaussianBlur_cpp(const py::array_t<uint8_t> src,
 
   std::vector<float> temp(s_h * s_w);
   auto result = py::array_t<uint8_t>({s_h, s_w});
-  auto raw_dst = result.mutable_unchecked<2>();
+  uint8_t *raw_dst = (uint8_t *)result.request().ptr;
 
+  // Horizontal pass
 #pragma omp parallel for
   for (int y = 0; y < s_h; y++) {
     const uint8_t *row_ptr = raw_src + y * s_w;
@@ -524,15 +525,16 @@ py::array_t<uint8_t> gaussianBlur_cpp(const py::array_t<uint8_t> src,
     }
   }
 
+  // Vertical pass — row-major iteration for cache locality
 #pragma omp parallel for
-  for (int x = 0; x < s_w; x++) {
-    for (int y = 0; y < s_h; y++) {
+  for (int y = 0; y < s_h; y++) {
+    for (int x = 0; x < s_w; x++) {
       float val = 0.0f;
       for (int k = -half_ksize; k <= half_ksize; k++) {
-        int idx = std::min(std::max(y + k, 0), s_h - 1);
-        val += temp[idx * s_w + x] * kernel[k + half_ksize];
+        int iy = std::min(std::max(y + k, 0), s_h - 1);
+        val += temp[iy * s_w + x] * kernel[k + half_ksize];
       }
-      raw_dst(y, x) = clip_u8(val);
+      raw_dst[y * s_w + x] = clip_u8(val);
     }
   }
   return result;
@@ -818,52 +820,76 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
 
   int radius = d / 2;
   int kernel_size = 2 * radius + 1;
+  int k_count = kernel_size * kernel_size;
 
-  std::vector<float> space_weights(kernel_size * kernel_size);
-  std::vector<float> space_offs_x(kernel_size * kernel_size);
-  std::vector<float> space_offs_y(kernel_size * kernel_size);
-  float space_coeff = -0.5f / (sigmaSpace * sigmaSpace);
+  // Pre-compute kernel offsets as (dy, dx) ints and spatial weights
+  struct KernelEntry {
+    int dy, dx;
+    float space_w;
+  };
+  std::vector<KernelEntry> kernel_entries(k_count);
+  float space_coeff = -0.5f / (float)(sigmaSpace * sigmaSpace);
 
   int k_idx = 0;
-  for (int y = -radius; y <= radius; y++) {
-    for (int x = -radius; x <= radius; x++) {
-      float r2 = static_cast<float>(x * x + y * y);
-      space_weights[k_idx] = std::exp(r2 * space_coeff);
-      space_offs_x[k_idx] = x;
-      space_offs_y[k_idx] = y;
+  for (int ky = -radius; ky <= radius; ky++) {
+    for (int kx = -radius; kx <= radius; kx++) {
+      float r2 = (float)(kx * kx + ky * ky);
+      kernel_entries[k_idx] = {ky, kx, std::exp(r2 * space_coeff)};
       k_idx++;
     }
   }
 
-  float range_coeff = -0.5f / (sigmaColor * sigmaColor);
-  std::vector<float> range_weights(256);
+  // Pre-compute range (color) weight LUT
+  float range_coeff = -0.5f / (float)(sigmaColor * sigmaColor);
+  float range_weights[256];
   for (int i = 0; i < 256; i++) {
-    range_weights[i] = std::exp(i * i * range_coeff);
+    range_weights[i] = std::exp((float)(i * i) * range_coeff);
   }
 
-#pragma omp parallel for collapse(2)
+  // Pad source image by radius (replicate border) to eliminate bounds checks
+  int pad_w = s_w + 2 * radius;
+  int pad_h = s_h + 2 * radius;
+  std::vector<uint8_t> padded(pad_h * pad_w);
+
+  for (int y = 0; y < pad_h; y++) {
+    int sy = std::max(0, std::min(s_h - 1, y - radius));
+    const uint8_t *src_row = raw_src + sy * s_w;
+    uint8_t *pad_row = padded.data() + y * pad_w;
+    for (int x = 0; x < pad_w; x++) {
+      int sx = std::max(0, std::min(s_w - 1, x - radius));
+      pad_row[x] = src_row[sx];
+    }
+  }
+
+  const uint8_t *pad_ptr = padded.data();
+
+  // Pre-compute kernel offsets relative to padded image stride
+  std::vector<int> k_offsets(k_count);
+  for (int k = 0; k < k_count; k++) {
+    k_offsets[k] = kernel_entries[k].dy * pad_w + kernel_entries[k].dx;
+  }
+
+#pragma omp parallel for
   for (int y = 0; y < s_h; y++) {
-    const uint8_t *row_ptr = raw_src + y * s_w;
-    uint8_t *dst_row_ptr = raw_dst + y * s_w;
+    uint8_t *dst_row = raw_dst + y * s_w;
+    // Pointer to (y+radius, radius) in padded image = center of pixel (y,0)
+    const uint8_t *center_row = pad_ptr + (y + radius) * pad_w + radius;
 
     for (int x = 0; x < s_w; x++) {
+      const uint8_t *center_ptr = center_row + x;
+      int center_val = *center_ptr;
       float sum = 0.0f;
       float w_sum = 0.0f;
-      int center_val = row_ptr[x];
 
-      for (int k = 0; k < kernel_size * kernel_size; k++) {
-        int nx = x + static_cast<int>(space_offs_x[k]);
-        int ny = y + static_cast<int>(space_offs_y[k]);
-
-        if (nx >= 0 && nx < s_w && ny >= 0 && ny < s_h) {
-          int neighbor_val = raw_src[ny * s_w + nx];
-          float weight = space_weights[k] *
-                         range_weights[std::abs(neighbor_val - center_val)];
-          sum += neighbor_val * weight;
-          w_sum += weight;
-        }
+      // No bounds checks needed — padded image guarantees valid access
+      for (int k = 0; k < k_count; k++) {
+        int neighbor_val = center_ptr[k_offsets[k]];
+        float weight = kernel_entries[k].space_w *
+                       range_weights[std::abs(neighbor_val - center_val)];
+        sum += neighbor_val * weight;
+        w_sum += weight;
       }
-      dst_row_ptr[x] = clip_u8(sum / w_sum);
+      dst_row[x] = clip_u8(sum / w_sum);
     }
   }
   return result;
@@ -1115,6 +1141,24 @@ py::array_t<uint8_t> bitwise_or_cpp(const py::array_t<uint8_t> src1,
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++)
       r(y, x) = s1(y, x) | s2(y, x);
+
+  return result;
+}
+
+// ---------- bitwise_and_cpp ----------
+py::array_t<uint8_t> bitwise_and_cpp(const py::array_t<uint8_t> src1,
+                                     const py::array_t<uint8_t> src2) {
+  auto s1 = src1.unchecked<2>();
+  auto s2 = src2.unchecked<2>();
+  int h = s1.shape(0), w = s1.shape(1);
+
+  py::array_t<uint8_t> result({h, w});
+  auto r = result.mutable_unchecked<2>();
+
+#pragma omp parallel for schedule(static)
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      r(y, x) = s1(y, x) & s2(y, x);
 
   return result;
 }
@@ -1462,6 +1506,9 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
 
   m.def("bitwise_or_cpp", &bitwise_or_cpp, py::arg("src1"), py::arg("src2"),
         "Element-wise bitwise OR of two uint8 images.");
+
+  m.def("bitwise_and_cpp", &bitwise_and_cpp, py::arg("src1"), py::arg("src2"),
+        "Element-wise bitwise AND of two uint8 images.");
 
   m.def("fillConvexPoly_cpp", &fillConvexPoly_cpp, py::arg("img"),
         py::arg("points"), py::arg("color"),

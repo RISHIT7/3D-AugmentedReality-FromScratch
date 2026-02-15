@@ -213,6 +213,31 @@ def refine_corners(gray, corners):
     criteria = (CustomCV2.TERM_CRITERIA_EPS + CustomCV2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     return CustomCV2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
 
+def is_valid_quadrilateral(pts, min_side=5.0, max_side_ratio=4.0, min_angle=40.0, max_angle=140.0):
+    """Check if a 4-point polygon is geometrically consistent with a (perspective-warped) square.
+    Rejects elongated parallelograms, extreme trapezoids, and noise artifacts."""
+    pts = pts.reshape(4, 2).astype(np.float64)
+
+    # Side lengths
+    sides = np.array([np.sqrt(np.sum((pts[(i+1) % 4] - pts[i])**2)) for i in range(4)])
+    if np.min(sides) < min_side:
+        return False
+    if np.max(sides) / (np.min(sides) + 1e-8) > max_side_ratio:
+        return False
+
+    # Interior angles
+    for i in range(4):
+        v1 = pts[(i - 1) % 4] - pts[i]
+        v2 = pts[(i + 1) % 4] - pts[i]
+        dot = np.dot(v1, v2)
+        norms = np.sqrt(np.sum(v1**2)) * np.sqrt(np.sum(v2**2)) + 1e-8
+        cos_angle = np.clip(dot / norms, -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        if angle_deg < min_angle or angle_deg > max_angle:
+            return False
+
+    return True
+
 def check_border(processed, cell, margin):
     side = processed.shape[0]
     indices = np.clip(((np.arange(TAG_BORDER_WIDTH) + 0.5) * cell).astype(int), 0, side - 1)
@@ -393,7 +418,7 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
         peri = CustomCV2.arcLength(cnt, True)
         quad = CustomCV2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        if len(quad) == 4 and CustomCV2.isContourConvex(quad):
+        if len(quad) == 4 and CustomCV2.isContourConvex(quad) and is_valid_quadrilateral(quad):
             M = CustomCV2.moments(cnt)
             if M["m00"] == 0:
                 continue
@@ -462,15 +487,37 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
     MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9
 
     gray = CustomCV2.cvtColor(frame, CustomCV2.COLOR_BGR2GRAY)
-    blurred = CustomCV2.bilateralFilter(gray, 9, 75, 75)
 
-    block_sizes = [8, 11, 21]
-    thresh = np.zeros_like(gray)
-    for bs in block_sizes:
-        t = CustomCV2.adaptiveThreshold(blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C, CustomCV2.THRESH_BINARY_INV, bs, 7)
-        thresh = CustomCV2.bitwise_or(thresh, t)
+    scales = [
+        (8, 5),
+        (21, 11)
+    ]
 
-    detected_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
+    detected_tags = []
+    detected_centers = []
+
+    for block_size, blur_size in scales:
+        blurred = CustomCV2.bilateralFilter(gray, blur_size, 75, 75)
+        thresh = CustomCV2.adaptiveThreshold(
+            blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C,
+            CustomCV2.THRESH_BINARY_INV, block_size, 7
+        )
+
+        cv2.imshow(f"Thresh{block_size}", thresh)
+
+        scale_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
+
+        for tag in scale_tags:
+            tag_center = np.mean(tag["corners"], axis=0)
+            too_close = False
+            for existing_center in detected_centers:
+                if np.sum((tag_center - existing_center)**2) < CENTER_PROXIMITY_THRESH_SQUARED:
+                    too_close = True
+                    break
+
+            if not too_close:
+                detected_tags.append(tag)
+                detected_centers.append(tag_center)
 
     if camera_matrix is None:
         h, w = frame.shape[:2]
@@ -503,10 +550,10 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
             ], dtype=np.float64)
             
             img_pts = tag["corners"].astype(np.float64)
-            success, rvec, tvec = cv2.solvePnP(obj_pts_3d, img_pts, camera_matrix.astype(np.float64), None, flags=cv2.SOLVEPNP_ITERATIVE)
+            success, rvec, tvec = CustomCV2.solvePnP(obj_pts_3d, img_pts, camera_matrix.astype(np.float64), None)
             
             if success:
-                R, _ = cv2.Rodrigues(rvec)
+                R, _ = CustomCV2.Rodrigues(rvec)
                 Rt = np.column_stack((R, tvec))
                 
                 Rx = np.array([
