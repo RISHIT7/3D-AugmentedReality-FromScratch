@@ -1,6 +1,6 @@
 #include <algorithm>
 #include <cmath>
-#include <iostream>
+#include <cstring>
 #include <omp.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -565,121 +565,228 @@ py::array_t<uint8_t> cvtColor_cpp(const py::array_t<uint8_t> src) {
   return result;
 }
 
+static uint8_t otsu_threshold_value(const uint8_t *data, int n) {
+  int hist[256] = {0};
+  for (int i = 0; i < n; i++)
+    hist[data[i]]++;
+  float sum = 0;
+  for (int i = 0; i < 256; i++)
+    sum += i * hist[i];
+  float sum_b = 0;
+  int w_b = 0;
+  float max_var = 0;
+  int best_t = 0;
+  for (int t = 0; t < 256; t++) {
+    w_b += hist[t];
+    if (w_b == 0)
+      continue;
+    int w_f = n - w_b;
+    if (w_f == 0)
+      break;
+    sum_b += t * hist[t];
+    float mu_b = sum_b / w_b;
+    float mu_f = (sum - sum_b) / w_f;
+    float diff = mu_b - mu_f;
+    float var = (float)w_b * w_f * diff * diff;
+    if (var > max_var) {
+      max_var = var;
+      best_t = t;
+    }
+  }
+  return (uint8_t)best_t;
+}
+
+static void sharpen_normalize_inplace(const uint8_t *src, uint8_t *sharpened,
+                                      uint8_t *thresholded, int side) {
+  std::vector<float> temp(side * side);
+  float mn = 1e9f, mx = -1e9f;
+  for (int y = 0; y < side; y++) {
+    for (int x = 0; x < side; x++) {
+      int c = src[y * side + x];
+      int u = (y > 0) ? src[(y - 1) * side + x] : c;
+      int d = (y < side - 1) ? src[(y + 1) * side + x] : c;
+      int l = (x > 0) ? src[y * side + x - 1] : c;
+      int r = (x < side - 1) ? src[y * side + x + 1] : c;
+      float val = 5.0f * c - u - d - l - r;
+      temp[y * side + x] = val;
+      mn = std::min(mn, val);
+      mx = std::max(mx, val);
+    }
+  }
+  float range = mx - mn;
+  if (range < 1e-6f)
+    range = 1.0f;
+  for (int i = 0; i < side * side; i++)
+    sharpened[i] = clip_u8((temp[i] - mn) * 255.0f / range);
+  uint8_t otsu_t = otsu_threshold_value(sharpened, side * side);
+  for (int i = 0; i < side * side; i++)
+    thresholded[i] = (sharpened[i] > otsu_t) ? 255 : 0;
+}
+
+static void erode_inplace(const uint8_t *src, uint8_t *dst, int h, int w,
+                          int ksize, int iterations) {
+  int pad = ksize / 2;
+  std::vector<uint8_t> buf_a(src, src + h * w), buf_b(h * w);
+  uint8_t *cur = buf_a.data(), *nxt = buf_b.data();
+  for (int iter = 0; iter < iterations; iter++) {
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        uint8_t mn = 255;
+        for (int ky = -pad; ky <= pad; ky++) {
+          for (int kx = -pad; kx <= pad; kx++) {
+            int ny = std::max(0, std::min(h - 1, y + ky));
+            int nx = std::max(0, std::min(w - 1, x + kx));
+            mn = std::min(mn, cur[ny * w + nx]);
+          }
+        }
+        nxt[y * w + x] = mn;
+      }
+    }
+    std::swap(cur, nxt);
+  }
+  std::memcpy(dst, cur, h * w);
+}
+
+static float patch_median(const uint8_t *img, int h, int w, int cy, int cx,
+                          int half) {
+  int y0 = std::max(0, cy - half);
+  int y1 = std::min(h, cy + half + 1);
+  int x0 = std::max(0, cx - half);
+  int x1 = std::min(w, cx + half + 1);
+  std::vector<uint8_t> vals;
+  for (int y = y0; y < y1; y++)
+    for (int x = x0; x < x1; x++)
+      vals.push_back(img[y * w + x]);
+  if (vals.empty())
+    return 0;
+  std::sort(vals.begin(), vals.end());
+  return (float)vals[vals.size() / 2];
+}
+
 py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
   auto buf_warped = warped.request();
+  if (buf_warped.ndim != 2)
+    return py::make_tuple(py::none(), py::none(), -2);
 
-  if (buf_warped.ndim != 2) {
-    return py::make_tuple(py::none(), py::none());
-  }
+  int SIDE = (int)buf_warped.shape[0];
+  int width = (int)buf_warped.shape[1];
+  if (SIDE != width || SIDE < 64)
+    return py::make_tuple(py::none(), py::none(), -2);
 
-  int SIDE = static_cast<int>(buf_warped.shape[0]);
-  int width = static_cast<int>(buf_warped.shape[1]);
-  if (SIDE != width || SIDE < 64) {
-    return py::make_tuple(py::none(), py::none());
-  }
+  const uint8_t *raw = (const uint8_t *)buf_warped.ptr;
 
-  const uint8_t *raw_warped = static_cast<const uint8_t *>(buf_warped.ptr);
+  std::vector<uint8_t> sharpened(SIDE * SIDE), threshold_img(SIDE * SIDE);
+  sharpen_normalize_inplace(raw, sharpened.data(), threshold_img.data(), SIDE);
 
-  float cell_size = static_cast<float>(SIDE) / 8.0f;
-  int margin = std::max(1, static_cast<int>(cell_size * 0.5f));
+  float cell = (float)SIDE / 8.0f;
+  int margin = std::max(1, (int)(cell / 2.0f));
   margin = std::min(margin, SIDE / 4);
 
-  const int border_threshold = 150;
-
-  for (int i = 0; i < 8; i++) {
-    int idx = (int)((i + 0.5f) * cell_size);
-    if (idx < 0 || idx >= SIDE)
-      continue;
-    if (raw_warped[margin * SIDE + idx] > border_threshold)
-      return py::make_tuple(py::none(), py::none());
-    if (raw_warped[(SIDE - 1 - margin) * SIDE + idx] > border_threshold)
-      return py::make_tuple(py::none(), py::none());
+  int border_indices[1];
+  for (int i = 0; i < 1; i++) {
+    int idx = (int)((i + 0.5f) * cell);
+    idx = std::max(0, std::min(idx, SIDE - 1));
+    if (threshold_img[margin * SIDE + idx] > 127)
+      return py::make_tuple(py::none(), py::none(), -1);
+    if (threshold_img[(SIDE - 1 - margin) * SIDE + idx] > 127)
+      return py::make_tuple(py::none(), py::none(), -1);
+    if (threshold_img[idx * SIDE + margin] > 127)
+      return py::make_tuple(py::none(), py::none(), -1);
+    if (threshold_img[idx * SIDE + (SIDE - 1 - margin)] > 127)
+      return py::make_tuple(py::none(), py::none(), -1);
   }
 
-  for (int i = 0; i < 8; i++) {
-    int idx = (int)((i + 0.5f) * cell_size);
-    if (idx < 0 || idx >= SIDE)
-      continue;
-    if (raw_warped[idx * SIDE + margin] > border_threshold)
-      return py::make_tuple(py::none(), py::none());
-    if (raw_warped[idx * SIDE + (SIDE - 1 - margin)] > border_threshold)
-      return py::make_tuple(py::none(), py::none());
-  }
-
-  const int CORE_INDICES[4] = {2, 3, 4, 5};
-  const float ORIENTATION_THRESHOLD = 155.0f;
-  const float ADAPTIVE_THRESH_MIN_RANGE = 30.0f;
-  const int MAX_TAG_ID = 15;
-
+  const int CI[4] = {2, 3, 4, 5};
   uint8_t grid_bits[4][4] = {{0}};
-  float grid_intensities[4][4] = {{0.0f}};
 
-  for (int r_idx = 0; r_idx < 4; ++r_idx) {
-    int grid_row = CORE_INDICES[r_idx];
-    int y = get_center_coord(grid_row, cell_size);
+  for (int r_idx = 0; r_idx < 4; r_idx++) {
+    int y = get_center_coord(CI[r_idx], cell);
+    if (y < 0 || y >= SIDE)
+      return py::make_tuple(py::none(), py::none(), -2);
 
-    if (y < 0 || y >= SIDE) {
-      return py::make_tuple(py::none(), py::none());
+    std::vector<float> row_sig(SIDE);
+    for (int x = 0; x < SIDE; x++)
+      row_sig[x] = (float)threshold_img[y * SIDE + x];
+
+    std::vector<float> blurred;
+    gaussian_blur_1d(row_sig, blurred, SIDE);
+
+    int ds = std::max(0, std::min((int)(2 * cell), SIDE - 1));
+    int de = std::max(ds + 1, std::min((int)(6 * cell), SIDE));
+    float lmin = blurred[ds], lmax = blurred[ds];
+    for (int x = ds; x < de; x++) {
+      lmin = std::min(lmin, blurred[x]);
+      lmax = std::max(lmax, blurred[x]);
     }
+    float row_thresh = (lmin + lmax) * 0.5f;
+    if ((lmax - lmin) < 30.0f)
+      row_thresh = 155.0f;
 
-    std::vector<float> row_signal(SIDE);
-    for (int x = 0; x < SIDE; ++x) {
-      row_signal[x] = static_cast<float>(raw_warped[y * SIDE + x]);
+    for (int c_idx = 0; c_idx < 4; c_idx++) {
+      int x = get_center_coord(CI[c_idx], cell);
+      if (x < 0 || x >= SIDE)
+        return py::make_tuple(py::none(), py::none(), -2);
+      grid_bits[r_idx][c_idx] = (blurred[x] > row_thresh) ? 1 : 0;
     }
+  }
 
-    std::vector<float> blurred_row;
-    gaussian_blur_1d(row_signal, blurred_row, SIDE);
+  int anchor_y[4] = {get_center_coord(5, cell), get_center_coord(5, cell),
+                     get_center_coord(2, cell), get_center_coord(2, cell)};
+  int anchor_x[4] = {get_center_coord(5, cell), get_center_coord(2, cell),
+                     get_center_coord(2, cell), get_center_coord(5, cell)};
 
-    float row_value[4];
-    for (int c_idx = 0; c_idx < 4; ++c_idx) {
-      int x = get_center_coord(CORE_INDICES[c_idx], cell_size);
-      if (x < 0 || x >= SIDE) {
-        return py::make_tuple(py::none(), py::none());
+  int erode_k = std::max(3, (int)(cell * 0.15f)) | 1;
+  std::vector<uint8_t> eroded(SIDE * SIDE);
+  erode_inplace(threshold_img.data(), eroded.data(), SIDE, SIDE, erode_k, 2);
+
+  int ph = std::max(2, (int)(cell * 0.2f));
+
+  float eroded_vals[4];
+  for (int i = 0; i < 4; i++)
+    eroded_vals[i] =
+        patch_median(eroded.data(), SIDE, SIDE, anchor_y[i], anchor_x[i], ph);
+
+  std::vector<int> white_corners;
+  for (int i = 0; i < 4; i++)
+    if (eroded_vals[i] > 127)
+      white_corners.push_back(i);
+
+  int orientation;
+  if (white_corners.size() == 1) {
+    orientation = white_corners[0];
+  } else {
+    float gs_vals[4];
+    for (int i = 0; i < 4; i++)
+      gs_vals[i] = patch_median(sharpened.data(), SIDE, SIDE, anchor_y[i],
+                                anchor_x[i], ph);
+
+    int max_idx = 0;
+    float max_v = gs_vals[0];
+    float min_v = gs_vals[0];
+    for (int i = 1; i < 4; i++) {
+      if (gs_vals[i] > max_v) {
+        max_v = gs_vals[i];
+        max_idx = i;
       }
-
-      row_value[c_idx] = blurred_row[x];
+      if (gs_vals[i] < min_v)
+        min_v = gs_vals[i];
     }
 
-    int data_start_x = static_cast<int>(2 * cell_size);
-    int data_end_x = static_cast<int>(6 * cell_size);
+    if (max_v < 100.0f && (max_v - min_v) < 15.0f)
+      return py::make_tuple(py::none(), py::none(), -4);
 
-    data_start_x = std::max(0, std::min(data_start_x, SIDE - 1));
-    data_end_x = std::max(data_start_x + 1, std::min(data_end_x, SIDE));
-
-    float local_min = blurred_row[data_start_x];
-    float local_max = blurred_row[data_start_x];
-
-    for (int x = data_start_x; x < data_end_x; x++) {
-      local_min = std::min(local_min, blurred_row[x]);
-      local_max = std::max(local_max, blurred_row[x]);
+    if (white_corners.size() >= 2) {
+      orientation = white_corners[0];
+      float best = gs_vals[white_corners[0]];
+      for (size_t i = 1; i < white_corners.size(); i++) {
+        if (gs_vals[white_corners[i]] > best) {
+          best = gs_vals[white_corners[i]];
+          orientation = white_corners[i];
+        }
+      }
+    } else {
+      orientation = max_idx;
     }
-
-    float row_threshold = (local_min + local_max) * 0.5f;
-
-    if ((local_max - local_min) < ADAPTIVE_THRESH_MIN_RANGE) {
-      row_threshold = 155.0f;
-    }
-
-    for (int c_idx = 0; c_idx < 4; ++c_idx) {
-      grid_intensities[r_idx][c_idx] = row_value[c_idx];
-      grid_bits[r_idx][c_idx] = (row_value[c_idx] > row_threshold) ? 1 : 0;
-    }
-  }
-
-  float anchor_values[4] = {grid_intensities[3][3], grid_intensities[3][0],
-                            grid_intensities[0][0], grid_intensities[0][3]};
-
-  int status = 0;
-  float max_val = anchor_values[0];
-  for (int i = 1; i < 4; i++) {
-    if (anchor_values[i] > max_val) {
-      max_val = anchor_values[i];
-      status = i;
-    }
-  }
-
-  if (max_val < ORIENTATION_THRESHOLD) {
-    return py::make_tuple(py::none(), py::none());
   }
 
   const int bit_map[4][4][2] = {{{1, 1}, {1, 2}, {2, 2}, {2, 1}},
@@ -688,26 +795,16 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
                                 {{2, 1}, {1, 1}, {1, 2}, {2, 2}}};
 
   int tag_id = 0;
-  for (int r = 0; r < 4; ++r) {
-    int br = bit_map[status][r][0];
-    int bc = bit_map[status][r][1];
-    uint8_t bit = grid_bits[br][bc];
-    tag_id |= (bit << r);
+  for (int r = 0; r < 4; r++) {
+    int br = bit_map[orientation][r][0];
+    int bc = bit_map[orientation][r][1];
+    tag_id |= (grid_bits[br][bc] << r);
   }
 
-  if (tag_id == 12) {
-    for (int x = 0; x < 4; ++x) {
-      for (int y = 0; y < 4; ++y) {
-        std::cout << (int)grid_intensities[x][y] << " ";
-      }
-      std::cout << std::endl;
-    }
-  }
+  if (tag_id < 0 || tag_id > 15)
+    return py::make_tuple(py::none(), py::none(), -3);
 
-  if (tag_id < 0 || tag_id > MAX_TAG_ID) {
-    return py::make_tuple(py::none(), py::none());
-  }
-  return py::make_tuple(tag_id, status);
+  return py::make_tuple(tag_id, orientation, 0);
 }
 
 py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
@@ -1076,6 +1173,229 @@ void fillConvexPoly_cpp(py::array_t<uint8_t> img, const py::array_t<int> points,
   }
 }
 
+py::array_t<double> rodrigues_cpp(py::array_t<double> src) {
+  auto buf = src.request();
+  double *p = (double *)buf.ptr;
+
+  bool is_mat = (buf.ndim == 2 && buf.shape[0] == 3 && buf.shape[1] == 3);
+
+  if (is_mat) {
+    double R[9];
+    for (int i = 0; i < 9; i++)
+      R[i] = p[i];
+    double cos_t =
+        std::max(-1.0, std::min(1.0, (R[0] + R[4] + R[8] - 1.0) / 2.0));
+    double theta = std::acos(cos_t);
+    auto result = py::array_t<double>({3, 1});
+    double *out = (double *)result.request().ptr;
+    if (theta < 1e-6) {
+      out[0] = out[1] = out[2] = 0;
+      return result;
+    }
+    double v[3] = {R[7] - R[5], R[2] - R[6], R[3] - R[1]};
+    double s = 2.0 * std::sin(theta);
+    if (std::abs(s) < 1e-10) {
+      double S[3] = {(R[0] + 1) / 2.0, (R[4] + 1) / 2.0, (R[8] + 1) / 2.0};
+      for (int i = 0; i < 3; i++)
+        S[i] = std::max(0.0, S[i]);
+      double k[3] = {std::sqrt(S[0]), std::sqrt(S[1]), std::sqrt(S[2])};
+      if (k[0] > 1e-6) {
+        if (R[1] < 0)
+          k[1] = -k[1];
+        if (R[2] < 0)
+          k[2] = -k[2];
+      } else if (k[1] > 1e-6) {
+        if (R[5] < 0)
+          k[2] = -k[2];
+      }
+      for (int i = 0; i < 3; i++)
+        out[i] = k[i] * theta;
+      return result;
+    }
+    for (int i = 0; i < 3; i++)
+      out[i] = (theta / s) * v[i];
+    return result;
+  } else {
+    int n = 1;
+    for (int i = 0; i < buf.ndim; i++)
+      n *= buf.shape[i];
+    double r[3] = {p[0], p[1], (n >= 3) ? p[2] : 0.0};
+    double theta = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    auto result = py::array_t<double>({3, 3});
+    double *out = (double *)result.request().ptr;
+    if (theta < 1e-6) {
+      for (int i = 0; i < 9; i++)
+        out[i] = (i % 4 == 0) ? 1.0 : 0.0;
+      return result;
+    }
+    double k[3] = {r[0] / theta, r[1] / theta, r[2] / theta};
+    double c = std::cos(theta), s = std::sin(theta);
+    out[0] = c + (1 - c) * k[0] * k[0];
+    out[1] = (1 - c) * k[0] * k[1] - s * k[2];
+    out[2] = (1 - c) * k[0] * k[2] + s * k[1];
+    out[3] = (1 - c) * k[1] * k[0] + s * k[2];
+    out[4] = c + (1 - c) * k[1] * k[1];
+    out[5] = (1 - c) * k[1] * k[2] - s * k[0];
+    out[6] = (1 - c) * k[2] * k[0] - s * k[1];
+    out[7] = (1 - c) * k[2] * k[1] + s * k[0];
+    out[8] = c + (1 - c) * k[2] * k[2];
+    return result;
+  }
+}
+
+py::tuple solvePnP_cpp(py::array_t<double> objectPoints,
+                       py::array_t<double> imagePoints,
+                       py::array_t<double> cameraMatrix) {
+  auto obj_buf = objectPoints.request();
+  auto img_buf = imagePoints.request();
+  auto cam_buf = cameraMatrix.request();
+  double *obj = (double *)obj_buf.ptr;
+  double *img_p = (double *)img_buf.ptr;
+  double *K = (double *)cam_buf.ptr;
+
+  double obj_2d[4][2], img_2d[4][2];
+  for (int i = 0; i < 4; i++) {
+    obj_2d[i][0] = obj[i * 3 + 0];
+    obj_2d[i][1] = obj[i * 3 + 1];
+    img_2d[i][0] = img_p[i * 2 + 0];
+    img_2d[i][1] = img_p[i * 2 + 1];
+  }
+
+  double A[8][9];
+  std::memset(A, 0, sizeof(A));
+  for (int i = 0; i < 4; i++) {
+    double X = obj_2d[i][0], Y = obj_2d[i][1];
+    double u = img_2d[i][0], v = img_2d[i][1];
+    A[2 * i][0] = X;
+    A[2 * i][1] = Y;
+    A[2 * i][2] = 1;
+    A[2 * i][6] = -u * X;
+    A[2 * i][7] = -u * Y;
+    A[2 * i][8] = -u;
+    A[2 * i + 1][3] = X;
+    A[2 * i + 1][4] = Y;
+    A[2 * i + 1][5] = 1;
+    A[2 * i + 1][6] = -v * X;
+    A[2 * i + 1][7] = -v * Y;
+    A[2 * i + 1][8] = -v;
+  }
+
+  for (int col = 0; col < 8; col++) {
+    int pivot = -1;
+    double max_v = 0;
+    for (int row = col; row < 8; row++) {
+      if (std::abs(A[row][col]) > max_v) {
+        max_v = std::abs(A[row][col]);
+        pivot = row;
+      }
+    }
+    if (pivot < 0 || max_v < 1e-12)
+      return py::make_tuple(false, py::none(), py::none());
+    if (pivot != col)
+      for (int j = 0; j < 9; j++)
+        std::swap(A[col][j], A[pivot][j]);
+    double scale = A[col][col];
+    for (int j = col; j < 9; j++)
+      A[col][j] /= scale;
+    for (int row = 0; row < 8; row++) {
+      if (row == col)
+        continue;
+      double f = A[row][col];
+      for (int j = col; j < 9; j++)
+        A[row][j] -= f * A[col][j];
+    }
+  }
+
+  double H[9];
+  for (int i = 0; i < 8; i++)
+    H[i] = -A[i][8];
+  H[8] = 1.0;
+
+  double K_inv[9];
+  double det_K = K[0] * (K[4] * K[8] - K[5] * K[7]) -
+                 K[1] * (K[3] * K[8] - K[5] * K[6]) +
+                 K[2] * (K[3] * K[7] - K[4] * K[6]);
+  if (std::abs(det_K) < 1e-12)
+    return py::make_tuple(false, py::none(), py::none());
+  double inv_det = 1.0 / det_K;
+  K_inv[0] = (K[4] * K[8] - K[5] * K[7]) * inv_det;
+  K_inv[1] = (K[2] * K[7] - K[1] * K[8]) * inv_det;
+  K_inv[2] = (K[1] * K[5] - K[2] * K[4]) * inv_det;
+  K_inv[3] = (K[5] * K[6] - K[3] * K[8]) * inv_det;
+  K_inv[4] = (K[0] * K[8] - K[2] * K[6]) * inv_det;
+  K_inv[5] = (K[2] * K[3] - K[0] * K[5]) * inv_det;
+  K_inv[6] = (K[3] * K[7] - K[4] * K[6]) * inv_det;
+  K_inv[7] = (K[1] * K[6] - K[0] * K[7]) * inv_det;
+  K_inv[8] = (K[0] * K[4] - K[1] * K[3]) * inv_det;
+
+  double M[9];
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      M[i * 3 + j] = 0;
+      for (int k = 0; k < 3; k++)
+        M[i * 3 + j] += K_inv[i * 3 + k] * H[k * 3 + j];
+    }
+
+  double h1[3] = {M[0], M[3], M[6]};
+  double h2[3] = {M[1], M[4], M[7]};
+  double h3[3] = {M[2], M[5], M[8]};
+
+  double norm_h1 = std::sqrt(h1[0] * h1[0] + h1[1] * h1[1] + h1[2] * h1[2]);
+  if (norm_h1 < 1e-12)
+    return py::make_tuple(false, py::none(), py::none());
+  double lam = 1.0 / norm_h1;
+  if (h3[2] * lam < 0)
+    lam = -lam;
+
+  double r1[3], r2[3], t[3];
+  for (int i = 0; i < 3; i++) {
+    r1[i] = lam * h1[i];
+    r2[i] = lam * h2[i];
+    t[i] = lam * h3[i];
+  }
+
+  double r3[3] = {r1[1] * r2[2] - r1[2] * r2[1], r1[2] * r2[0] - r1[0] * r2[2],
+                  r1[0] * r2[1] - r1[1] * r2[0]};
+
+  double r2n[3] = {r3[1] * r1[2] - r3[2] * r1[1], r3[2] * r1[0] - r3[0] * r1[2],
+                   r3[0] * r1[1] - r3[1] * r1[0]};
+  for (int i = 0; i < 3; i++)
+    r2[i] = r2n[i];
+
+  auto norm3 = [](double *v) {
+    double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (n > 1e-12)
+      for (int i = 0; i < 3; i++)
+        v[i] /= n;
+  };
+  norm3(r1);
+  norm3(r2);
+  norm3(r3);
+
+  double R[9] = {r1[0], r2[0], r3[0], r1[1], r2[1], r3[1], r1[2], r2[2], r3[2]};
+  double det_R = R[0] * (R[4] * R[8] - R[5] * R[7]) -
+                 R[1] * (R[3] * R[8] - R[5] * R[6]) +
+                 R[2] * (R[3] * R[7] - R[4] * R[6]);
+  if (det_R < 0) {
+    for (int i = 0; i < 9; i++)
+      R[i] = -R[i];
+    for (int i = 0; i < 3; i++)
+      t[i] = -t[i];
+  }
+
+  auto R_arr = py::array_t<double>({3, 3});
+  std::memcpy(R_arr.request().ptr, R, 9 * sizeof(double));
+  auto rvec = rodrigues_cpp(R_arr);
+
+  auto tvec = py::array_t<double>({3, 1});
+  double *tv = (double *)tvec.request().ptr;
+  tv[0] = t[0];
+  tv[1] = t[1];
+  tv[2] = t[2];
+
+  return py::make_tuple(true, rvec, tvec);
+}
+
 PYBIND11_MODULE(custom_cv2_cpp, m) {
   m.doc() = "Custom OpenCV-like functions implemented in C++ with OpenMP";
 
@@ -1111,8 +1431,14 @@ PYBIND11_MODULE(custom_cv2_cpp, m) {
         "Converts a BGR image to grayscale.");
 
   m.def("decode_tag_cpp", &decode_tag_cpp, py::arg("warped"),
-        "Decodes a tag from a warped grayscale image and returns the tag ID "
-        "and orientation status.");
+        "Decodes a tag from a warped grayscale image.");
+
+  m.def("rodrigues_cpp", &rodrigues_cpp, py::arg("src"),
+        "Rodrigues rotation conversion.");
+
+  m.def("solvePnP_cpp", &solvePnP_cpp, py::arg("objectPoints"),
+        py::arg("imagePoints"), py::arg("cameraMatrix"),
+        "Solve PnP for planar objects.");
 
   m.def("bilateralFilter_cpp", &bilateralFilter_cpp, py::arg("src"),
         py::arg("d"), py::arg("sigmaColor"), py::arg("sigmaSpace"),
