@@ -2,6 +2,7 @@ import cv2
 import argparse
 import numpy as np
 from core.utils import *
+import calibration
 
 from core.evaluate import Evaluator
 
@@ -14,7 +15,23 @@ def main():
     parser.add_argument("--angle-granularity", type=str, choices=['1deg', '5deg', '10deg'], 
                         default='5deg', help="Angle measurement granularity (default: 5deg)")
     
+    # Calibration arguments
+    parser.add_argument("--calibrate", action="store_true", help="Run in calibration mode.")
+    parser.add_argument("--calibrate_source", type=str, help="Source for calibration (video/images).", default=None)
+    parser.add_argument("--grid_size", type=int, nargs=2, default=[8, 11], help="Grid size (rows, cols) for calibration.")
+    parser.add_argument("--out", type=str, default="assets/calibration.npy", help="Output path for calibration.")
+    parser.add_argument("--no_view", action="store_true", help="Disable visualization.")
+
     args = parser.parse_args()
+    
+    if args.calibrate:
+        if not args.calibrate_source:
+            print("Error: --calibrate_source is required for calibration mode.")
+            return
+        print(f"Starting calibration with source: {args.calibrate_source}")
+        view_scale = 0 if args.no_view else 0.5
+        calibration.calibrate(args.calibrate_source, tuple(args.grid_size), args.out, view_scale)
+        return
     
     video_source = args.video if args.video else 0
     cap = cv2.VideoCapture(video_source)

@@ -1,8 +1,8 @@
 import cv2
-from core.cv2_functions import CustomCV2
 import numpy as np
+import warnings
+from core.cv2_functions import CustomCV2
 import math
-from collections import deque
 
 import sys
 import os
@@ -15,163 +15,6 @@ except ImportError as e:
     CPP_AVAILABLE = False
     print("C++ acceleration not available, using Python fallback")
 
-tag_trackers = {}
-
-class AdaptiveKalmanFilter:
-    def __init__(self, process_noise=1e-4, measurement_noise=1e-1, error_estimate=1.0):
-        self.state = np.zeros(4, dtype=np.float32)
-
-        self.F = np.array([[1, 0, 1, 0],
-                           [0, 1, 0, 1],
-                           [0, 0, 1, 0],
-                           [0, 0, 0, 1]], dtype=np.float32)
-
-        self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]], dtype=np.float32)
-
-        self.P = np.eye(4, dtype=np.float32) * error_estimate
-        self.base_Q = np.eye(4, dtype=np.float32) * process_noise
-        self.base_R = np.eye(2, dtype=np.float32) * measurement_noise
-        self.Q = self.base_Q.copy()
-        self.R = self.base_R.copy()
-
-        self.velocity_history = deque(maxlen=5)
-        self.innovation_history = deque(maxlen=3)
-        self.last_position = None
-
-    def predict(self):
-        self.state = np.dot(self.F, self.state)
-        self.P = np.dot(self.F, np.dot(self.P, self.F.T)) + self.Q
-        return self.state[:2]
-
-    def adapt_noise(self, innovation):
-        innovation_magnitude = np.linalg.norm(innovation)
-        self.innovation_history.append(innovation_magnitude)
-
-        velocity = self.state[2:4]
-        speed = np.linalg.norm(velocity)
-        self.velocity_history.append(speed)
-
-
-        avg_innovation = np.mean(self.innovation_history) if len(self.innovation_history) > 0 else 0
-        avg_speed = np.mean(self.velocity_history) if len(self.velocity_history) > 0 else 0
-
-        if avg_speed > 5.0 or avg_innovation > 20.0:
-            process_multiplier = 1.0 + min(avg_speed * 0.05, 5.0)
-            measurement_multiplier = 0.5
-        elif avg_speed < 1.0 and avg_innovation < 5.0:
-            process_multiplier = 0.5
-            measurement_multiplier = 1.5
-        else:
-            process_multiplier = 1.0
-            measurement_multiplier = 1.0
-
-        self.Q = self.base_Q * process_multiplier
-        self.R = self.base_R * measurement_multiplier
-
-    def update(self, meas_x, meas_y):
-        measurement = np.array([meas_x, meas_y], dtype=np.float32)
-
-        predicted_measurement = np.dot(self.H, self.state)
-        innovation = measurement - predicted_measurement
-
-        self.adapt_noise(innovation)
-
-        S = np.dot(self.H, np.dot(self.P, self.H.T)) + self.R
-        K = np.dot(self.P, np.dot(self.H.T, np.linalg.inv(S)))
-        self.state = self.state + np.dot(K, innovation)
-
-        I = np.eye(4, dtype=np.float32)
-        self.P = np.dot(I - np.dot(K, self.H), self.P)
-
-        if self.last_position is not None:
-            measured_velocity = measurement - self.last_position
-            self.state[2:4] = 0.7 * self.state[2:4] + 0.3 * measured_velocity
-
-        self.last_position = measurement.copy()
-
-        return self.state[:2]
-
-class ExponentialMovingAverage:
-    def __init__(self, alpha=0.7):
-        self.alpha = alpha
-        self.value = None
-
-    def update(self, measurement):
-        if self.value is None:
-            self.value = measurement
-        else:
-            self.value = self.alpha * measurement + (1 - self.alpha) * self.value
-        return self.value
-
-class HybridFilter:
-    def __init__(self):
-        self.kalman = AdaptiveKalmanFilter(
-            process_noise=2e-4,
-            measurement_noise=5e-2,
-            error_estimate=1.0
-        )
-        self.ema = ExponentialMovingAverage(alpha=0.6)
-        self.is_initialized = False
-        self.outlier_threshold = 50.0
-        self.last_valid_position = None
-
-    def is_outlier(self, measurement):
-        if self.last_valid_position is None:
-            return False
-
-        distance = np.linalg.norm(measurement - self.last_valid_position)
-        return distance > self.outlier_threshold
-
-    def update(self, measurement):
-        if not self.is_initialized:
-            self.kalman.state[:2] = measurement
-            self.ema.value = measurement
-            self.last_valid_position = measurement
-            self.is_initialized = True
-            return measurement
-
-        if self.is_outlier(measurement):
-            prediction = self.kalman.predict()
-            return prediction
-
-        kalman_prediction = self.kalman.predict()
-        kalman_estimate = self.kalman.update(measurement[0], measurement[1])
-        ema_estimate = self.ema.update(measurement)
-
-        speed = np.linalg.norm(self.kalman.state[2:4])
-
-        if speed > 10.0:
-            blend_factor = 0.8
-        elif speed < 2.0:
-            blend_factor = 0.4
-        else:
-            blend_factor = 0.6
-
-        result = blend_factor * kalman_estimate + (1 - blend_factor) * ema_estimate
-        self.last_valid_position = result.copy()
-
-        return result
-
-class TagTracker:
-    def __init__(self):
-        self.filters = [HybridFilter() for _ in range(4)]
-        self.is_initialized = False
-
-    def update(self, tag_corners):
-        if not self.is_initialized:
-            for i in range(4):
-                self.filters[i].kalman.state[:2] = tag_corners[i]
-                self.filters[i].ema.value = tag_corners[i]
-            self.is_initialized = True
-            return tag_corners
-
-        smoothed_corners = []
-        for i in range(4):
-            smoothed = self.filters[i].update(tag_corners[i])
-            smoothed_corners.append(smoothed)
-
-        return np.array(smoothed_corners, dtype=np.float32)
 
 SIDE = 400
 WARP_DST = np.array([[0, 0], [SIDE-1, 0], [SIDE-1, SIDE-1], [0, SIDE-1]], dtype="float32")
@@ -231,9 +74,12 @@ def render(img, obj, projection, tag_corners, tag_size=2.0, color=(100, 100, 100
     n = len(vertices_3d)
     vertices_homo = np.column_stack([vertices_3d, np.ones(n)])
 
-    try:
+    # Perform projection with warning suppression (spurious warnings observed)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         projected = projection @ vertices_homo.T
-    except Exception:
+    
+    if not np.all(np.isfinite(projected)):
         return img
 
     w = projected[2, :]
@@ -335,84 +181,6 @@ def compute_fine_grained_orientation(corners, granularity='1deg'):
     if granularity == '10deg': return round(angle_deg / 10) * 10
     return round(angle_deg)
 
-def compute_3d_orientation(camera_matrix, homography):
-    K_inv = np.linalg.inv(camera_matrix)
-    RT = np.dot(K_inv, homography)
-
-    norm_1 = np.linalg.norm(RT[:, 0])
-    norm_2 = np.linalg.norm(RT[:, 1])
-    norm = (norm_1 + norm_2) / 2.0
-
-    if norm < 1e-6:
-        return 0, 0, 0
-
-    RT = RT / norm
-
-    r1 = RT[:, 0]
-    r2 = RT[:, 1]
-    r3 = np.cross(r1, r2)
-
-    R = np.column_stack((r1, r2, r3))
-
-    roll = np.arctan2(R[2, 1], R[2, 2])
-
-    pitch = np.arctan2(-R[2, 0], np.sqrt(R[2, 1]**2 + R[2, 2]**2))
-
-    yaw = np.arctan2(R[1, 0], R[0, 0])
-
-    roll_deg = np.degrees(roll)
-    pitch_deg = np.degrees(pitch)
-    yaw_deg = np.degrees(yaw)
-
-    yaw_deg = yaw_deg % 360
-
-    return roll_deg, pitch_deg, yaw_deg
-
-
-def get_projection_matrix(camera_matrix, homography):
-    try:
-        K_inv = np.linalg.inv(camera_matrix)
-    except np.linalg.LinAlgError:
-        return None
-
-    RT = np.dot(K_inv, homography)
-
-    h1 = RT[:, 0]
-    h2 = RT[:, 1]
-    h3 = RT[:, 2]
-
-    norm1 = np.linalg.norm(h1)
-    norm2 = np.linalg.norm(h2)
-    lambda_scale = (norm1 + norm2) / 2.0
-
-    if lambda_scale < 1e-6:
-        return None
-
-    r1 = h1 / lambda_scale
-    r2 = h2 / lambda_scale
-    t = h3 / lambda_scale
-
-    r3 = np.cross(r1, r2)
-
-    Q = np.column_stack((r1, r2, r3))
-    U, _, Vt = np.linalg.svd(Q)
-    R = np.dot(U, Vt)
-
-    if np.linalg.det(R) < 0:
-        R = -R
-        t = -t
-
-    if t[2] < 0:
-        r1 = -r1
-        r2 = -r2
-        t = -t
-        r3 = np.cross(r1, r2)
-        Q = np.column_stack((r1, r2, r3))
-        U, _, Vt = np.linalg.svd(Q)
-        R = np.dot(U, Vt)
-
-    return np.column_stack((R, t))
-
 def hex_to_rgb(hex_color):
     hex_color = hex_color.lstrip('#')
     h_len = len(hex_color)
@@ -421,24 +189,32 @@ def hex_to_rgb(hex_color):
 def order_points(pts):
     pts = pts.reshape(4, 2)
 
-    x_sorted = pts[np.argsort(pts[:, 0])]
+    x_sorted = pts[np.argsort(pts[:, 0]), :]
 
-    left = x_sorted[:2]
-    right = x_sorted[2:]
+    left_most = x_sorted[:2, :]
+    right_most = x_sorted[2:, :]
 
-    left = left[np.argsort(left[:, 1])]
-    (tl, bl) = left
+    if abs(x_sorted[1, 0] - x_sorted[2, 0]) < 1.0:
+        y_sorted = pts[np.argsort(pts[:, 1]), :]
+        tl = y_sorted[0]
+        br = y_sorted[3]
+        
+        mid_pts = y_sorted[1:3]
+        mid_pts_x_sorted = mid_pts[np.argsort(mid_pts[:, 0])]
+        bl = mid_pts_x_sorted[0]
+        tr = mid_pts_x_sorted[1]
+    else:
+        left_most = left_most[np.argsort(left_most[:, 1]), :]
+        (tl, bl) = left_most
 
-    right = right[np.argsort(right[:, 1])]
-    (tr, br) = right
+        right_most = right_most[np.argsort(right_most[:, 1]), :]
+        (tr, br) = right_most
 
     return np.array([tl, tr, br, bl], dtype="float32")
-
 
 def refine_corners(gray, corners):
     criteria = (CustomCV2.TERM_CRITERIA_EPS + CustomCV2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     return CustomCV2.cornerSubPix(gray, corners.astype(np.float32), (5, 5), (-1, -1), criteria)
-
 
 def check_border(processed, cell, margin):
     side = processed.shape[0]
@@ -457,7 +233,6 @@ def check_border(processed, cell, margin):
             return False
 
     return True
-
 
 ERROR_CODE = {
     "INVALID_BORDER": -1,
@@ -569,7 +344,6 @@ def decode_tag(warped_tag: np.ndarray):
 
     return tag_id, orientation, ERROR_CODE["SUCCESS"]
 
-
 def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
     contours, _ = CustomCV2.findContours(thresh, CustomCV2.RETR_TREE, CustomCV2.CHAIN_APPROX_SIMPLE)
     candidates = []
@@ -643,7 +417,6 @@ def process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA):
 
     return candidates
 
-
 def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, angle_granularity='5deg'):
     MIN_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.0003 
     MAX_TAG_AREA = frame.shape[0] * frame.shape[1] * 0.9
@@ -665,13 +438,13 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
 
     for tag in detected_tags:
         tag_id = tag["id"]
-        smoothed_corners = tag["corners"]
-        tag['angle'] = compute_fine_grained_orientation(smoothed_corners, angle_granularity)
+        corners = tag["corners"]
+        tag['angle'] = compute_fine_grained_orientation(corners, angle_granularity)
 
         if template_img is not None:
             h_temp, w_temp = template_img.shape[:2]
             src_pts = np.array([[0, 0], [w_temp-1, 0], [w_temp-1, h_temp-1], [0, h_temp-1]], dtype="float32")
-            H = CustomCV2.getPerspectiveTransform(src_pts, smoothed_corners)
+            H = CustomCV2.getPerspectiveTransform(src_pts, tag["corners"])
             try:
                 H_inv = np.linalg.inv(H)
                 if CPP_AVAILABLE:
@@ -681,35 +454,88 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
             except: pass
 
         if obj_model is not None:
-            half_size = 1.0 
-            obj_pts_2d = np.array([
-                [-half_size, -half_size], 
-                [ half_size, -half_size], 
-                [ half_size,  half_size], 
-                [-half_size,  half_size]
-            ], dtype=np.float32)
+            # 3D points for the tag corners (normalized).
+            # standard: TL, TR, BR, BL
+            # We assume the tag is on the XY plane (z=0).
+            # Half-size 1.0 means the tag is 2x2 in object space.
+            half_size = 1.0
+            obj_pts_3d = np.array([
+                [-half_size, -half_size, 0], # TL
+                [ half_size, -half_size, 0], # TR
+                [ half_size,  half_size, 0], # BR
+                [-half_size,  half_size, 0]  # BL
+            ], dtype=np.float64)
+            
+            # Image points are already in TL, TR, BR, BL order from order_points
+            img_pts = tag["corners"].astype(np.float64)
 
-            H_3d = CustomCV2.getPerspectiveTransform(obj_pts_2d, smoothed_corners)
-
-            if H_3d is not None and np.all(np.isfinite(H_3d)) and np.linalg.det(H_3d) != 0:
-                Rt = get_projection_matrix(camera_matrix.astype(np.float64), H_3d)
-
-                if Rt is not None and np.all(np.isfinite(Rt)):
-                    projection = np.dot(camera_matrix.astype(np.float64), Rt)
-
-                    frame = render(frame, obj_model, projection, smoothed_corners, 
-                                  tag_size=half_size * 2, color=(80, 80, 80), scale=2.5)
+            # Solve PnP
+            # We assume zero distortion for simplicity if not provided.
+            # Use ITERATIVE for robustness or IPPE_SQUARE. Let's try ITERATIVE.
+            success, rvec, tvec = cv2.solvePnP(obj_pts_3d, img_pts, camera_matrix.astype(np.float64), None, flags=cv2.SOLVEPNP_ITERATIVE)
+            
+            if success:
+                # Convert rvec to Rotation Matrix
+                R, _ = cv2.Rodrigues(rvec)
+                
+                # Construct Projection Matrix [R | t]
+                Rt = np.column_stack((R, tvec))
+                
+                # To fix the "upside down" issue:
+                # The tag coordinate system has Z pointing INTO the table (standard vision frame X-right, Y-down, Z-forward).
+                # The object likely expects +Z or +Y to be "up" (out of the table).
+                # We need to rotate the object coordinate system relative to the tag.
+                # Only Rotate 180 deg around X-axis: Y -> -Y, Z -> -Z.
+                # This makes +Z point OUT of the table (towards camera).
+                
+                Rx = np.array([
+                    [1,  0,  0, 0],
+                    [0, -1,  0, 0],
+                    [0,  0, -1, 0],
+                    [0,  0,  0, 1]
+                ], dtype=np.float64)
+                
+                # We effectively multiply the ModelView matrix by this rotation
+                # P = K * [R|t]
+                # P_new = K * [R|t] * Rx ? No.
+                # Points are P_model. We want P_tag = Rx * P_model.
+                # So we project: K * [R|t] * Rx * P_model_homo
+                
+                # Construct 4x4 Extrinsics matrix to apply rotation easily
+                Extrinsics = np.eye(4, dtype=np.float64)
+                Extrinsics[:3, :4] = Rt
+                
+                # Apply rotation to the object frame
+                Rt_new = Extrinsics @ Rx
+                Rt_new = Rt_new[:3, :4] # Back to 3x4
+                
+                # Full Projection transformation: K * Rt_new
+                projection = np.dot(camera_matrix.astype(np.float64), Rt_new)
+                
+                # Debug: Check for extreme values
+                if not np.all(np.isfinite(projection)):
+                    print(f"Projected matrix contains inf/nan: {projection}")
+                elif np.max(np.abs(projection)) > 1e10:
+                    print(f"Projected matrix values too large: {projection}")
+                elif tvec[2] < 0:
+                    print(f"Warning: tvec Z is negative ({tvec[2]}), tag behind camera?")
+                elif tvec[2] < 1.0: # Very close to camera?
+                     print(f"Warning: tvec Z is very small ({tvec[2]})")
+                
+                # Check for validity
+                if np.all(np.isfinite(projection)):
+                    frame = render(frame, obj_model, projection, tag["corners"], 
+                                    tag_size=half_size * 2, color=(80, 80, 80), scale=2.5)
 
         if obj_model is None and template_img is None:  
-            cv2.polylines(frame, [np.int32(smoothed_corners)], True, (0, 255, 0), 2)
-            cv2.putText(frame, f"ID: {tag_id}", tuple(np.int32(smoothed_corners[0])), 
+            cv2.polylines(frame, [np.int32(tag["corners"])], True, (0, 255, 0), 2)
+            cv2.putText(frame, f"ID: {tag_id}", tuple(np.int32(tag["corners"][0])), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.putText(frame, f"Angle: {tag['angle']:.1f}deg", 
-                    tuple(np.int32(smoothed_corners[1]) + np.array([0, 30])), 
+                    tuple(np.int32(tag["corners"][1]) + np.array([0, 30])), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
 
     return frame, detected_tags
-
 
 def overlay_image_python(frame, overlay, H):
     h_frame, w_frame = frame.shape[:2]

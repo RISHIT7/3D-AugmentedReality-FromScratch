@@ -6,6 +6,8 @@
 
 4) pybind
 
+5) render, render_with_lighting
+
 
 -----
 - warp prespective

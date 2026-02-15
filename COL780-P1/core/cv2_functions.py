@@ -110,7 +110,7 @@ class CustomCV2:
         wd = dx * dy
 
         if src.ndim == 2:
-            return (src[y0, x0] * wa + src[y0, x1] * wb + src[y1, x0] * wc + src[y1, x1] * wd).astype(src.dtype)
+            return (src[y0, x0] * wa + src[y1, x0] * wb + src[y0, x1] * wc + src[y1, x1] * wd).astype(src.dtype)
         else:
             wa, wb, wc, wd = [w[..., None] for w in (wa, wb, wc, wd)]
             return (src[y0, x0] * wa + src[y1, x0] * wb + src[y0, x1] * wc + src[y1, x1] * wd).astype(src.dtype)
