@@ -682,7 +682,6 @@ py::tuple decode_tag_cpp(const py::array_t<uint8_t> warped) {
   int margin = std::max(1, (int)(cell / 2.0f));
   margin = std::min(margin, SIDE / 4);
 
-  int border_indices[1];
   for (int i = 0; i < 1; i++) {
     int idx = (int)((i + 0.5f) * cell);
     idx = std::max(0, std::min(idx, SIDE - 1));
@@ -939,7 +938,6 @@ py::array_t<float> cornerSubPix_cpp(const py::array_t<uint8_t> image,
     float cy = r_result(i, 0, 1);
 
     for (int iter = 0; iter < max_iter; iter++) {
-      float gx = 0, gy = 0;
       double Gxx = 0, Gxy = 0, Gyy = 0;
       double bx = 0, by = 0;
 
@@ -957,9 +955,6 @@ py::array_t<float> cornerSubPix_cpp(const py::array_t<uint8_t> image,
           float dx = 0.5f * (row_ptr[x + 1] - row_ptr[x - 1]);
           float dy = 0.5f * (raw_image[(y + 1) * s_w + x] -
                              raw_image[(y - 1) * s_w + x]);
-
-          gx += dx;
-          gy += dy;
 
           Gxx += dx * dx;
           Gxy += dx * dy;

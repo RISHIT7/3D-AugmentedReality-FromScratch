@@ -40,9 +40,9 @@ class OBJ:
                         v = [float(values[1]), float(values[2]), float(values[3])]
                         if swapyz:
                             v = [v[0], v[2], v[1]]
-                        elif swapxy:
+                        if swapxy:
                             v = [v[1], v[0], v[2]]
-                        elif swapxz:
+                        if swapxz:
                             v = [v[2], v[1], v[0]]
                         self.vertices.append(v)
                     elif values[0] == 'f':

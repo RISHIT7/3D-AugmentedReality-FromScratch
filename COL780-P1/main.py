@@ -13,7 +13,7 @@ def parser_tasks(args):
     obj_model = None
     if args.model:
         try:
-            obj_model = OBJ(args.model, swapyz=True, swapxy=True)
+            obj_model = OBJ(args.model, swapyz=True, swapxy=True, swapxz=False)
         except Exception as e:
             print(f"Could not load 3D model: {e}")
     
