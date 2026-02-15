@@ -105,9 +105,6 @@ bool normalize_invert_3x3(const double *mat, double *invMat) {
   invMat[7] = (normMat[1] * normMat[6] - normMat[0] * normMat[7]) * invDet;
   invMat[8] = (normMat[0] * normMat[4] - normMat[1] * normMat[3]) * invDet;
 
-  // (normMat)^{-1} = (mat/maxVal)^{-1} = maxVal * mat^{-1}
-  // We want mat^{-1}, so multiply by scale = 1/maxVal
-  // But invMat is already (normMat)^{-1}, so multiply by scale to get mat^{-1}
   for (int i = 0; i < 9; i++) {
     invMat[i] *= scale;
   }
@@ -509,7 +506,6 @@ py::array_t<uint8_t> gaussianBlur_cpp(const py::array_t<uint8_t> src,
   auto result = py::array_t<uint8_t>({s_h, s_w});
   uint8_t *raw_dst = (uint8_t *)result.request().ptr;
 
-  // Horizontal pass
 #pragma omp parallel for
   for (int y = 0; y < s_h; y++) {
     const uint8_t *row_ptr = raw_src + y * s_w;
@@ -525,7 +521,6 @@ py::array_t<uint8_t> gaussianBlur_cpp(const py::array_t<uint8_t> src,
     }
   }
 
-  // Vertical pass — row-major iteration for cache locality
 #pragma omp parallel for
   for (int y = 0; y < s_h; y++) {
     for (int x = 0; x < s_w; x++) {
@@ -822,7 +817,6 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
   int kernel_size = 2 * radius + 1;
   int k_count = kernel_size * kernel_size;
 
-  // Pre-compute kernel offsets as (dy, dx) ints and spatial weights
   struct KernelEntry {
     int dy, dx;
     float space_w;
@@ -839,14 +833,12 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
     }
   }
 
-  // Pre-compute range (color) weight LUT
   float range_coeff = -0.5f / (float)(sigmaColor * sigmaColor);
   float range_weights[256];
   for (int i = 0; i < 256; i++) {
     range_weights[i] = std::exp((float)(i * i) * range_coeff);
   }
 
-  // Pad source image by radius (replicate border) to eliminate bounds checks
   int pad_w = s_w + 2 * radius;
   int pad_h = s_h + 2 * radius;
   std::vector<uint8_t> padded(pad_h * pad_w);
@@ -863,7 +855,6 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
 
   const uint8_t *pad_ptr = padded.data();
 
-  // Pre-compute kernel offsets relative to padded image stride
   std::vector<int> k_offsets(k_count);
   for (int k = 0; k < k_count; k++) {
     k_offsets[k] = kernel_entries[k].dy * pad_w + kernel_entries[k].dx;
@@ -872,7 +863,6 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
 #pragma omp parallel for
   for (int y = 0; y < s_h; y++) {
     uint8_t *dst_row = raw_dst + y * s_w;
-    // Pointer to (y+radius, radius) in padded image = center of pixel (y,0)
     const uint8_t *center_row = pad_ptr + (y + radius) * pad_w + radius;
 
     for (int x = 0; x < s_w; x++) {
@@ -881,7 +871,6 @@ py::array_t<uint8_t> bilateralFilter_cpp(const py::array_t<uint8_t> src, int d,
       float sum = 0.0f;
       float w_sum = 0.0f;
 
-      // No bounds checks needed — padded image guarantees valid access
       for (int k = 0; k < k_count; k++) {
         int neighbor_val = center_ptr[k_offsets[k]];
         float weight = kernel_entries[k].space_w *
@@ -1078,7 +1067,6 @@ py::array_t<uint8_t> overlay_image_cpp(py::array_t<uint8_t> frame,
   return frame;
 }
 
-// ---------- erode_cpp ----------
 py::array_t<uint8_t> erode_cpp(const py::array_t<uint8_t> src,
                                const py::array_t<uint8_t> kernel,
                                int iterations) {
@@ -1088,14 +1076,12 @@ py::array_t<uint8_t> erode_cpp(const py::array_t<uint8_t> src,
   int kh = k.shape(0), kw = k.shape(1);
   int pad_h = kh / 2, pad_w = kw / 2;
 
-  // Pre-collect kernel offsets
   std::vector<std::pair<int, int>> offsets;
   for (int ky = 0; ky < kh; ky++)
     for (int kx = 0; kx < kw; kx++)
       if (k(ky, kx) > 0)
         offsets.push_back({ky - pad_h, kx - pad_w});
 
-  // Allocate buffers
   std::vector<uint8_t> buf_a(h * w), buf_b(h * w);
   for (int i = 0; i < h; i++)
     for (int j = 0; j < w; j++)
@@ -1127,7 +1113,6 @@ py::array_t<uint8_t> erode_cpp(const py::array_t<uint8_t> src,
   return result;
 }
 
-// ---------- bitwise_or_cpp ----------
 py::array_t<uint8_t> bitwise_or_cpp(const py::array_t<uint8_t> src1,
                                     const py::array_t<uint8_t> src2) {
   auto s1 = src1.unchecked<2>();
@@ -1145,7 +1130,6 @@ py::array_t<uint8_t> bitwise_or_cpp(const py::array_t<uint8_t> src1,
   return result;
 }
 
-// ---------- bitwise_and_cpp ----------
 py::array_t<uint8_t> bitwise_and_cpp(const py::array_t<uint8_t> src1,
                                      const py::array_t<uint8_t> src2) {
   auto s1 = src1.unchecked<2>();
@@ -1163,7 +1147,6 @@ py::array_t<uint8_t> bitwise_and_cpp(const py::array_t<uint8_t> src1,
   return result;
 }
 
-// ---------- fillConvexPoly_cpp ----------
 void fillConvexPoly_cpp(py::array_t<uint8_t> img, const py::array_t<int> points,
                         std::vector<int> color) {
   auto im = img.mutable_unchecked<3>();
@@ -1173,7 +1156,6 @@ void fillConvexPoly_cpp(py::array_t<uint8_t> img, const py::array_t<int> points,
   if (n < 3)
     return;
 
-  // Find y range
   int y_min = h, y_max = 0;
   for (int i = 0; i < n; i++) {
     y_min = std::min(y_min, pts(i, 1));

@@ -3,8 +3,6 @@
 This project implements a custom Augmented Reality (AR) pipeline for detecting fiducial markers, estimating their 3D pose, and rendering virtual objects with dynamic lighting. Key components are optimized in C++ for performance.
 
 ## 1. Prerequisites
--   **Python 3.8+**
--   **C++ Compiler**: Clang (macOS) or GCC (Linux) with OpenMP support.
 -   **Dependencies**:
     -   `numpy`
     -   `opencv-python` (for I/O only)

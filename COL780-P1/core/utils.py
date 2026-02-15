@@ -112,7 +112,6 @@ def _collect_visible_faces(obj, points_2d, w, valid_mask, img_shape, margin=2000
             face_data.append((avg_depth, face_points))
         except Exception:
             continue
-    # Painter's algorithm: draw far faces first
     face_data.sort(reverse=True, key=lambda x: x[0])
     return face_data
 
@@ -150,7 +149,6 @@ def render_with_lighting(img, obj, projection, tag_corners=None, tag_size=2.0,
     if not face_data:
         return img
 
-    # Compute relative depth range for shading
     all_depths = [d for d, _ in face_data]
     depth_min, depth_max = min(all_depths), max(all_depths)
     depth_range = depth_max - depth_min
@@ -158,8 +156,7 @@ def render_with_lighting(img, obj, projection, tag_corners=None, tag_size=2.0,
         depth_range = 1.0
 
     for depth, face_points in face_data:
-        # Shade: nearer faces (smaller depth) are brighter, farther faces are darker
-        t = (depth - depth_min) / depth_range  # 0 = nearest, 1 = farthest
+        t = (depth - depth_min) / depth_range
         shade_factor = max(0.5, min(1.0, 1.0 - 0.5 * t))
         face_color = tuple(int(c * shade_factor) for c in color)
         CustomCV2.fillConvexPoly(img, face_points, face_color)
@@ -218,14 +215,12 @@ def is_valid_quadrilateral(pts, min_side=5.0, max_side_ratio=4.0, min_angle=40.0
     Rejects elongated parallelograms, extreme trapezoids, and noise artifacts."""
     pts = pts.reshape(4, 2).astype(np.float64)
 
-    # Side lengths
     sides = np.array([np.sqrt(np.sum((pts[(i+1) % 4] - pts[i])**2)) for i in range(4)])
     if np.min(sides) < min_side:
         return False
     if np.max(sides) / (np.min(sides) + 1e-8) > max_side_ratio:
         return False
 
-    # Interior angles
     for i in range(4):
         v1 = pts[(i - 1) % 4] - pts[i]
         v2 = pts[(i + 1) % 4] - pts[i]
@@ -502,8 +497,6 @@ def process_frame(frame, template_img=None, obj_model=None, camera_matrix=None, 
             blurred, 255, CustomCV2.ADAPTIVE_THRESH_MEAN_C,
             CustomCV2.THRESH_BINARY_INV, block_size, 7
         )
-
-        cv2.imshow(f"Thresh{block_size}", thresh)
 
         scale_tags = process_contours(gray, thresh, MIN_TAG_AREA, MAX_TAG_AREA)
 

@@ -92,20 +92,7 @@ def main():
                 cv2.waitKey(0)
             if key == ord('r'):
                 paused = False
-    
-
-    if args.video:
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        out = cv2.VideoWriter('output.avi', fourcc, 20.0, (int(cap.get(3)), int(cap.get(4))))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-            processed_frame, _ = process_frame(frame, template_img, obj_model, camera_matrix, args.angle_granularity)
-            out.write(processed_frame)
-        out.release()
-
-
+        
     cap.release()
     cv2.destroyAllWindows()
 
