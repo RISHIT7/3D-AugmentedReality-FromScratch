@@ -130,6 +130,3 @@ Developed as part of
 Indian Institute of Technology Delhi
 
 ---
-
-> *Built, not called.*
-> *Computer Vision — the hard way.*
