@@ -1,4 +1,3 @@
-*.pdf
 assets/*
 .DS_Store
 *.obj
